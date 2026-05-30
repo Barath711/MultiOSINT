@@ -78,7 +78,7 @@ pip install customtkinter pillow requests urllib3 python-whois dnspython xposedo
 
 ### 2. Run
 ```bash
-pythonw MultiOSINTv10.pyw
+pythonw MultiOSINT.pyw
 ```
 > On Windows, use `pythonw` (not `python`) to avoid a console window.  
 > Or: right-click → Open with → `pythonw.exe` → tick *Always use this app*
