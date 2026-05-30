@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-OSINT MultiSearch v9
-=====================
+OSINT MultiSearch v10
+======================
 Multi-mode security tool:
   • OSINT Lookup  — IPs, Domains, Hashes, Email addresses
   • Phishing Analyzer — .eml / .msg triage with full enrichment
@@ -9,9 +9,11 @@ Multi-mode security tool:
 APIs (configured in Settings → saved to config.json):
   VirusTotal, AbuseIPDB, URLScan.io, GreyNoise, OTX AlienVault,
   Shodan, abuse.ch (URLhaus/ThreatFox/MalwareBazaar),
-  HaveIBeenPwned, Joe Sandbox
+  HaveIBeenPwned, Joe Sandbox,
+  IPQualityScore, CriminalIP, Pulsedive
 
-Free (no key): ip-api.com, DNS/rDNS, WHOIS
+Free (no key): ip-api.com, DNS/rDNS, WHOIS, CIRCL.lu HashLookup, PhishTank
+pip install customtkinter pillow requests urllib3 python-whois dnspython xposedornot
 """
 
 import re, os, sys, json, csv, socket, threading, time, base64, hashlib
@@ -71,6 +73,7 @@ DEFAULT_CONFIG = {
     "abusech": "",    "hibp": "",      "joe_key": "",
     "joe_server": "https://jbxcloud.joesecurity.org",
     "gemini_key": "",
+    "ipqs": "",        "criminalip": "", "pulsedive": "",
 }
 
 def load_config():
@@ -112,11 +115,19 @@ class OSINTModule:
         "censys":           "https://search.censys.io/hosts/",
         "otx":              "https://otx.alienvault.com/indicator/",
         "malwarebazaar":    "https://bazaar.abuse.ch/browse.php?search=",
+        "pulsedive":        "https://pulsedive.com/indicator/?ioc=",
+        "criminalip":       "https://www.criminalip.io/asset/report?ip=",
+        "phishtank":        "https://www.phishtank.com/search.php?valid=y&active=y&Search=Search&url=",
+        "hashlookup":       "https://hashlookup.circl.lu/lookup/sha256/",
+        "ipqs":             "https://www.ipqualityscore.com/free-ip-lookup-proxy-vpn-test/lookup/",
+        "breachvip":        "https://breach.vip/",
+        "xposedornot":      "https://xposedornot.com/xposed/#",
     }
     DEFAULT_SOURCES = {
-        "domain": ["virustotal","talosintelligence","ibmxforce","urlscan","mxtoolbox","threatfox"],
-        "ip":     ["virustotal","talosintelligence","abuseipdb","greynoise","shodan","censys","ipinfo"],
-        "hash":   ["virustotal","talosintelligence","ibmxforce","hybridanalysis","threatfox","malwarebazaar"],
+        "domain": ["virustotal","talosintelligence","ibmxforce","urlscan","mxtoolbox","threatfox","pulsedive","phishtank"],
+        "ip":     ["virustotal","talosintelligence","abuseipdb","greynoise","shodan","censys","ipinfo","criminalip","pulsedive","ipqs"],
+        "hash":   ["virustotal","talosintelligence","ibmxforce","hybridanalysis","threatfox","malwarebazaar","hashlookup","pulsedive"],
+        "email":  ["ipqs","breachvip","xposedornot"],
     }
 
     def __init__(self, config): self.config = config
@@ -143,6 +154,12 @@ class OSINTModule:
     def joe_server(self):       return self.config.get("joe_server", "https://jbxcloud.joesecurity.org")
     @property
     def gemini_key(self):       return self.config.get("gemini_key", "")
+    @property
+    def ipqs_api_key(self):     return self.config.get("ipqs", "")
+    @property
+    def criminalip_api_key(self): return self.config.get("criminalip", "")
+    @property
+    def pulsedive_api_key(self):  return self.config.get("pulsedive", "")
 
 
     def check_gemini_summary(self, results_text: str,
@@ -448,7 +465,36 @@ class OSINTModule:
             r["xon_error"] = f"XposedOrNot error: {e}"
         return r
 
-    # ── Free: IP Geolocation ──
+    # ── Breach.VIP (free — no API key required, 15 req/min) ──
+    def check_breachvip(self, ioc, field_type="email"):
+        """Search breach.vip for an email, domain, IP, or username in breach databases."""
+        r = {"bvip_results": [], "bvip_count": 0, "bvip_verdict": "", "bvip_error": ""}
+        try:
+            resp = requests.post(
+                "https://breach.vip/api/search",
+                json={"term": ioc, "fields": [field_type]},
+                timeout=15)
+            if resp.status_code == 200:
+                data = resp.json()
+                results = data.get("results", [])
+                r["bvip_count"] = len(results)
+                r["bvip_results"] = [
+                    {"source": item.get("source","?"),
+                     "categories": item.get("categories",""),
+                     "extra": {k: v for k, v in item.items() if k not in ("source","categories")}}
+                    for item in results[:30]
+                ]
+                if results:
+                    r["bvip_verdict"] = f"🔴 EXPOSED — found in {len(results)} breach source(s)"
+                else:
+                    r["bvip_verdict"] = "🟢 Not found in breach.vip database"
+            elif resp.status_code == 429:
+                r["bvip_error"] = "breach.vip: Rate limited (15 req/min)"
+            else:
+                r["bvip_error"] = f"breach.vip HTTP {resp.status_code}"
+        except Exception as e:
+            r["bvip_error"] = f"breach.vip error: {e}"
+        return r
     def check_ipapi(self, ioc):
         r = {k:"" for k in ["country","region","city","isp","org","asn","timezone","proxy","hosting","ipapi_error"]}
         try:
@@ -598,6 +644,178 @@ class OSINTModule:
                 r["tf_error"] = "ThreatFox: Register for a free API key at auth.abuse.ch"
             else: r["tf_error"] = f"ThreatFox error: HTTP {resp.status_code}"
         except Exception as e: r["tf_error"] = f"ThreatFox error: {e}"
+        return r
+
+    # ── IPQualityScore ──
+    def check_ipqs(self, ioc, ioc_type):
+        if not self.ipqs_api_key: return None
+        r = {k:"" for k in ["ipqs_score","ipqs_vpn","ipqs_proxy","ipqs_tor","ipqs_bot",
+                             "ipqs_disposable","ipqs_fraud_score","ipqs_verdict","ipqs_error"]}
+        try:
+            from urllib.parse import quote as _q
+            if ioc_type == "ip":
+                url = f"https://ipqualityscore.com/api/json/ip/{self.ipqs_api_key}/{ioc}"
+                params = {"strictness": 1}
+            elif ioc_type == "email":
+                url = f"https://ipqualityscore.com/api/json/email/{self.ipqs_api_key}/{_q(ioc)}"
+                params = {"strictness": 1, "fast": "true"}
+            elif ioc_type in ("domain", "url"):
+                url = f"https://ipqualityscore.com/api/json/url/{self.ipqs_api_key}/{_q(ioc)}"
+                params = {"strictness": 1}
+            else:
+                r["ipqs_error"] = "IPQS: unsupported IOC type"; return r
+            resp = requests.get(url, params=params, timeout=15, verify=False)
+            if resp.status_code == 200:
+                d = resp.json()
+                if not d.get("success", True):
+                    r["ipqs_error"] = d.get("message", "IPQS request failed"); return r
+                score = d.get("fraud_score", d.get("overall_score", 0))
+                r["ipqs_fraud_score"] = score
+                if ioc_type == "ip":
+                    r.update({"ipqs_vpn": "⚠️ Yes" if d.get("vpn") else "No",
+                               "ipqs_proxy": "⚠️ Yes" if d.get("proxy") else "No",
+                               "ipqs_tor": "🔴 Yes" if d.get("tor") else "No",
+                               "ipqs_bot": "🔴 Yes" if d.get("bot_status") else "No"})
+                elif ioc_type == "email":
+                    r.update({"ipqs_disposable": "🔴 Yes" if d.get("disposable") else "No",
+                               "ipqs_score": d.get("fraud_score", "")})
+                r["ipqs_verdict"] = ("🔴 HIGH RISK" if score >= 85
+                                     else "🟡 SUSPICIOUS" if score >= 50
+                                     else "🟢 Clean")
+            elif resp.status_code == 401: r["ipqs_error"] = "IPQS: Invalid API key."
+            elif resp.status_code == 429: r["ipqs_error"] = "IPQS: Rate limit exceeded."
+            else: r["ipqs_error"] = f"IPQS error: HTTP {resp.status_code}"
+        except Exception as e: r["ipqs_error"] = f"IPQS error: {e}"
+        return r
+
+    # ── CriminalIP ──
+    def check_criminalip(self, ioc):
+        if not self.criminalip_api_key: return None
+        r = {k:"" for k in ["cip_score","cip_type","cip_country","cip_org","cip_open_ports",
+                             "cip_cves","cip_tags","cip_verdict","cip_error"]}
+        try:
+            resp = requests.get("https://api.criminalip.io/v1/asset/ip/report",
+                headers={"x-api-key": self.criminalip_api_key},
+                params={"ip": ioc}, timeout=20, verify=False)
+            if resp.status_code == 200:
+                d = resp.json()
+                if d.get("status") == 200:
+                    score = d.get("score", {}).get("inbound", 0) or 0
+                    ip_data = d.get("ip", {}) or {}
+                    issues = d.get("issues", {}) or {}
+                    port_data = d.get("port", {}).get("data", []) or []
+                    ports = ", ".join(str(p.get("open_port_no","")) for p in port_data[:10] if p.get("open_port_no"))
+                    cves_raw = []
+                    for p in port_data[:5]:
+                        for cv in (p.get("vulnerability_info") or [])[:2]:
+                            cves_raw.append(cv.get("cve_id",""))
+                    tags = [k for k, v in issues.items() if v]
+                    r.update({"cip_score": score,
+                               "cip_type": ip_data.get("type",""),
+                               "cip_country": ip_data.get("country",""),
+                               "cip_org": ip_data.get("org",""),
+                               "cip_open_ports": ports,
+                               "cip_cves": ", ".join(cves_raw[:5]) or "None",
+                               "cip_tags": ", ".join(tags[:5]),
+                               "cip_verdict": ("🔴 CRITICAL" if score >= 80
+                                               else "🟡 SUSPICIOUS" if score >= 40
+                                               else "🟢 Clean")})
+                else:
+                    r["cip_error"] = d.get("message", f"CriminalIP error: {d.get('status')}")
+            elif resp.status_code == 401: r["cip_error"] = "CriminalIP: Invalid API key."
+            elif resp.status_code == 429: r["cip_error"] = "CriminalIP: Rate limit exceeded."
+            else: r["cip_error"] = f"CriminalIP error: HTTP {resp.status_code}"
+        except Exception as e: r["cip_error"] = f"CriminalIP error: {e}"
+        return r
+
+    # ── CIRCL.lu HashLookup (free, no key) ──
+    def check_hashlookup(self, hash_val):
+        r = {k:"" for k in ["hl_filename","hl_filetype","hl_known","hl_parents",
+                             "hl_verdict","hl_error"]}
+        try:
+            hlen = len(hash_val)
+            if hlen == 32:   endpoint = f"https://hashlookup.circl.lu/lookup/md5/{hash_val}"
+            elif hlen == 40: endpoint = f"https://hashlookup.circl.lu/lookup/sha1/{hash_val}"
+            elif hlen == 64: endpoint = f"https://hashlookup.circl.lu/lookup/sha256/{hash_val}"
+            else:
+                r["hl_error"] = "HashLookup: unsupported hash length"; return r
+            resp = requests.get(endpoint, timeout=10, verify=False,
+                                headers={"Accept": "application/json"})
+            if resp.status_code == 200:
+                d = resp.json()
+                r.update({"hl_filename": (d.get("FileName") or d.get("name",""))[:60],
+                           "hl_filetype": d.get("FileType","") or d.get("mime-type",""),
+                           "hl_known": "✅ Known-Good (NSRL)",
+                           "hl_verdict": "🟢 Known-Good file (NSRL HashLookup)"})
+                parents = d.get("parents", [])
+                r["hl_parents"] = str(len(parents)) if parents else ""
+            elif resp.status_code == 404:
+                r["hl_verdict"] = "⬜ Not in HashLookup DB (unknown hash)"
+                r["hl_known"] = "Unknown"
+            else:
+                r["hl_error"] = f"HashLookup HTTP {resp.status_code}"
+        except Exception as e: r["hl_error"] = f"HashLookup error: {e}"
+        return r
+
+    # ── Pulsedive ──
+    def check_pulsedive(self, ioc, ioc_type):
+        r = {k:"" for k in ["pd_risk","pd_type","pd_threats","pd_feeds","pd_tags",
+                             "pd_lastseen","pd_verdict","pd_error"]}
+        try:
+            params = {"ioc": ioc, "pretty": "1"}
+            if self.pulsedive_api_key:
+                params["key"] = self.pulsedive_api_key
+            resp = requests.get("https://pulsedive.com/api/info.php",
+                params=params, timeout=15, verify=False)
+            if resp.status_code == 200:
+                d = resp.json()
+                if d.get("error"):
+                    r["pd_verdict"] = "🟢 Not found in Pulsedive"; return r
+                risk = d.get("risk", "unknown") or "unknown"
+                threats = [t.get("name","") for t in (d.get("threats") or [])[:5] if t.get("name")]
+                feeds   = [f.get("name","") for f in (d.get("feeds")   or [])[:5] if f.get("name")]
+                tags    = [t.get("tag","")  for t in (d.get("tags")    or [])[:5] if t.get("tag")]
+                r.update({"pd_risk": risk,
+                           "pd_type": d.get("type",""),
+                           "pd_threats": ", ".join(threats) or "None",
+                           "pd_feeds":   ", ".join(feeds)   or "None",
+                           "pd_tags":    ", ".join(tags)    or "None",
+                           "pd_lastseen": d.get("stamp_updated",""),
+                           "pd_verdict": ("🔴 HIGH" if risk in ("high","critical","very high")
+                                          else "🟡 MEDIUM" if risk in ("medium","suspicious","unknown","none")
+                                          else "🟢 Low")})
+            elif resp.status_code == 404:
+                r["pd_verdict"] = "🟢 Not found in Pulsedive"
+            elif resp.status_code == 429:
+                r["pd_error"] = "Pulsedive: Rate limit exceeded."
+            else:
+                r["pd_error"] = f"Pulsedive error: HTTP {resp.status_code}"
+        except Exception as e: r["pd_error"] = f"Pulsedive error: {e}"
+        return r
+
+    # ── PhishTank (free, no key required) ──
+    def check_phishtank(self, url_or_domain):
+        r = {k:"" for k in ["pt_in_database","pt_verified","pt_phish_detail_url","pt_verdict","pt_error"]}
+        try:
+            target = url_or_domain if url_or_domain.startswith("http") else f"http://{url_or_domain}"
+            resp = requests.post("https://checkurl.phishtank.com/checkurl/",
+                data={"url": target, "format": "json", "app_key": ""},
+                headers={"User-Agent": "OSINTMultiSearch-v10"},
+                timeout=15, verify=False)
+            if resp.status_code == 200:
+                d = resp.json().get("results", {})
+                in_db    = d.get("in_database", False)
+                verified = d.get("verified", False)
+                detail   = d.get("phish_detail_url", "")
+                r.update({"pt_in_database": "Yes" if in_db else "No",
+                           "pt_verified":   "Yes" if verified else "No",
+                           "pt_phish_detail_url": detail,
+                           "pt_verdict": ("🔴 PHISHING (verified)" if (in_db and verified)
+                                          else "🟡 In PhishTank DB (unverified)" if in_db
+                                          else "🟢 Not in PhishTank")})
+            else:
+                r["pt_error"] = f"PhishTank error: HTTP {resp.status_code}"
+        except Exception as e: r["pt_error"] = f"PhishTank error: {e}"
         return r
 
     # ── URLScan.io Screenshot ──
@@ -1161,6 +1379,189 @@ def ph_joe_fetch(webid: str, api_key: str, server: str) -> dict:
     except Exception as e: return {"webid": webid, "status": "error", "error": str(e)[:80]}
 
 # ══════════════════════════════════════════════════════════════════
+# OSINT NAVIGATOR — 140+ tool index (inspired by ekky19/osint)
+# ══════════════════════════════════════════════════════════════════
+_NAV_SKIP = True  # shorthand
+NAV_TOOLS = {
+    "🔍 Search Tools": [
+        {"name": "VirusTotal",       "url": "https://www.virustotal.com/gui/search/",                           "desc": "Analyse IPs, domains, URLs & hashes",                  "tags": ["ip","url","hash","malware"]},
+        {"name": "URL Scan",         "url": "https://urlscan.io/search/#",                                      "desc": "Search domains, IPs, filenames, hashes, ASNs",         "tags": ["ip","url","hash"]},
+        {"name": "Hybrid Analysis",  "url": "https://www.hybrid-analysis.com/search?query=",                    "desc": "Malware analysis & threat intel",                       "tags": ["url","hash","ip","malware"]},
+        {"name": "Pulsedive",        "url": "https://pulsedive.com/ioc/",                                      "desc": "Search any domain, IP, or URL",                         "tags": ["ip","url","ioc"]},
+        {"name": "Abuse IP DB",      "url": "https://www.abuseipdb.com/check/",                                 "desc": "Check report history of any IP address",               "tags": ["ip"]},
+        {"name": "URLhaus",          "url": "https://urlhaus.abuse.ch/browse.php?search=",                      "desc": "Malicious URL tracker",                                "tags": ["url","hash"]},
+        {"name": "WhoisXML",         "url": "https://whois.whoisxmlapi.com/lookup?q=",                         "desc": "Domain/IP WHOIS records",                              "tags": ["url","ip","whois"]},
+        {"name": "URL Void",         "url": "https://www.urlvoid.com/scan/",                                    "desc": "Check online reputation of a website",                 "tags": ["url"]},
+        {"name": "Sucuri SiteCheck", "url": "https://sitecheck.sucuri.net/results/",                            "desc": "Malware / blacklist / software check",                 "tags": ["url"]},
+        {"name": "Talos Intelligence","url": "https://talosintelligence.com/reputation_center/lookup?search=",  "desc": "Cisco Talos threat intelligence",                      "tags": ["ip","url","email","hash"]},
+        {"name": "Rapid DNS",        "url": "https://rapiddns.io/s/",                                          "desc": "Discover subdomains for a target domain",              "tags": ["subdomain","dns","url"]},
+        {"name": "Google SafeBrowse","url": "https://transparencyreport.google.com/safe-browsing/search?url=",  "desc": "Google Safe Browsing check",                           "tags": ["url"]},
+        {"name": "Threat Yeti",      "url": "https://threatyeti.com/search?q=",                                "desc": "Full security analysis for domains/URLs",              "tags": ["url","ip"]},
+        {"name": "crt.sh",           "url": "https://crt.sh/?q=",                                              "desc": "Certificate transparency records",                     "tags": ["url","hash","cert"]},
+        {"name": "SecurityTrails",   "url": "https://securitytrails.com/domain/",                               "desc": "Domain & DNS historical data",                        "tags": ["url","hostname"]},
+        {"name": "DNS Propagation",  "url": "https://dnschecker.org/#A/",                                      "desc": "Global DNS propagation check",                        "tags": ["dns","url"]},
+        {"name": "IntelX",           "url": "https://intelx.io/?s=",                                           "desc": "Domain, URL, email, IP, CIDR search",                  "tags": ["ip","url","email","cidr"]},
+        {"name": "ThreatIntel Plat.", "url": "https://threatintelligenceplatform.com/report/",                  "desc": "Threat intel reports for domains/IPs",                "tags": ["url","ip"]},
+        {"name": "SocRadar IOC",     "url": "https://socradar.io/labs/app/ioc-radar/",                         "desc": "Advanced IOC threat intelligence search",              "tags": ["ip","hash","hostname"], "skipSearch": _NAV_SKIP},
+        {"name": "Have I Been Squatted","url": "https://haveibeensquatted.com/",                                "desc": "Check if a domain has been typosquatted",             "tags": ["url","domain"], "skipSearch": _NAV_SKIP},
+    ],
+    "🖥️ IP Info": [
+        {"name": "Criminal IP",      "url": "https://www.criminalip.io/asset/report?ip=",                       "desc": "IP attack surface & threat hunting",                   "tags": ["ip"]},
+        {"name": "IPinfo",           "url": "https://ipinfo.io/",                                               "desc": "IP geolocation, ASN, org",                            "tags": ["ip","asn"]},
+        {"name": "IP Void",          "url": "https://www.ipvoid.com/scan/",                                     "desc": "IP address reputation information",                   "tags": ["ip"]},
+        {"name": "IPQS Proxy Lookup","url": "https://www.ipqualityscore.com/free-ip-lookup-proxy-vpn-test/lookup/", "desc": "IP lookup & proxy/VPN/Tor detection",              "tags": ["ip","proxy","vpn"]},
+        {"name": "Spur",             "url": "https://spur.us/context/",                                        "desc": "Detect VPNs, residential proxies, and bots",          "tags": ["proxy","vpn","bot"]},
+        {"name": "GreyNoise",        "url": "https://viz.greynoise.io/query/",                                  "desc": "Internet background noise analysis",                  "tags": ["ip"]},
+        {"name": "ARIN RDAP",        "url": "https://search.arin.net/rdap/?query=",                             "desc": "ARIN WHOIS / RDAP lookup",                            "tags": ["ip","whois"]},
+        {"name": "DomainTools",      "url": "https://whois.domaintools.com/",                                   "desc": "WHOIS for domains and IPs",                           "tags": ["url","ip","whois"]},
+        {"name": "Feodo Tracker",    "url": "https://feodotracker.abuse.ch/browse.php?search=",                 "desc": "C2 IPs — Dridex, TrickBot, QakBot, Emotet",          "tags": ["ip","c2","botnet"]},
+        {"name": "SANS ISC",         "url": "https://isc.sans.edu/ipinfo.html?ip=",                             "desc": "SANS Internet Storm Center IP lookup",                "tags": ["ip","port"]},
+        {"name": "IP Hub",           "url": "https://iphub.info/?ip=",                                         "desc": "IP Hub proxy/VPN detection",                         "tags": ["ip","proxy","vpn"]},
+        {"name": "GeoIP HackerTarget","url": "https://api.hackertarget.com/geoip/?q=",                         "desc": "Geo IP lookup via HackerTarget",                      "tags": ["ip","geolocation"]},
+        {"name": "IP Details",       "url": "https://whatismyipaddress.com/ip/",                                "desc": "Full IP address details",                             "tags": ["ip"]},
+        {"name": "MXToolbox",        "url": "https://mxtoolbox.com/SuperTool.aspx?action=mx%3a",               "desc": "MX, DNS, blacklist lookup",                           "tags": ["url","dns","mx"]},
+        {"name": "CrowdSec Intel",   "url": "https://app.crowdsec.net/cti/",                                   "desc": "CrowdSec community threat intelligence",              "tags": ["ip"], "skipSearch": _NAV_SKIP},
+        {"name": "Sicehice",         "url": "https://sicehice.com/search/",                                    "desc": "Bulk IP searching & threat data aggregation",         "tags": ["ip"]},
+    ],
+    "🛡️ Threat Intelligence": [
+        {"name": "IBM X-Force",      "url": "https://exchange.xforce.ibmcloud.com/search/",                     "desc": "IP, URL, hash, CVE threat intel",                     "tags": ["url","ip","hash","cve"]},
+        {"name": "ThreatMiner",      "url": "https://www.threatminer.org/host.php?q=",                         "desc": "IP, domain, hash, email, APT notes",                  "tags": ["url","ip","hash","email"]},
+        {"name": "AlienVault OTX",   "url": "https://otx.alienvault.com/indicator/domain/",                    "desc": "Open Threat Intelligence Community",                  "tags": ["url","ip","hash"]},
+        {"name": "Onyphe",           "url": "https://www.onyphe.io/search?q=category:datascan+",               "desc": "Cyber threat & vulnerability intelligence",           "tags": ["url","ip"]},
+        {"name": "LeakIX",           "url": "https://leakix.net/search?scope=leak&q=",                         "desc": "Leaked services and assets search",                   "tags": ["url","ip","port"]},
+        {"name": "ThreatFox",        "url": "https://threatfox.abuse.ch/browse.php?search=ioc%3A",             "desc": "Community IOC sharing platform",                      "tags": ["ip","url","hash","ioc"]},
+        {"name": "ThreatLens",       "url": "https://threatlens.vercel.app/",                                  "desc": "One-stop threat intelligence lookup",                 "tags": ["url","ip","hash"], "skipSearch": _NAV_SKIP},
+        {"name": "ThreatView",       "url": "https://threatview.io/",                                          "desc": "Actionable cyber threat intelligence feeds",          "tags": ["c2","blocklist","hash"], "skipSearch": _NAV_SKIP},
+        {"name": "FOFA",             "url": "https://en.fofa.info/",                                           "desc": "Cybersecurity search engine for devices & services",  "tags": ["url","ip"], "skipSearch": _NAV_SKIP},
+        {"name": "Ransomware.live",  "url": "https://www.ransomware.live/",                                    "desc": "Live ransomware leak site tracker",                   "tags": ["ransomware"], "skipSearch": _NAV_SKIP},
+    ],
+    "🔑 Hash Lookup": [
+        {"name": "VT Hash",          "url": "https://www.virustotal.com/gui/search/",                          "desc": "VirusTotal hash analysis",                            "tags": ["hash","malware"]},
+        {"name": "Malshare",         "url": "https://malshare.com/sample.php?action=detail&hash=",             "desc": "Malware samples hash lookup",                         "tags": ["hash","malware"]},
+        {"name": "AlienVault File",  "url": "https://otx.alienvault.com/indicator/file/",                      "desc": "AlienVault OTX file/hash lookup",                     "tags": ["hash"]},
+        {"name": "Jotti",            "url": "https://virusscan.jotti.org/en-US/search/hash/",                  "desc": "Multi-AV hash scan",                                  "tags": ["hash"]},
+        {"name": "Valhalla",         "url": "https://valhalla.nextron-systems.com/info/search?keyword=",        "desc": "YARA / Sigma rule search by hash/keyword",            "tags": ["hash","yara"]},
+        {"name": "CIRCL HashLookup", "url": "https://hashlookup.circl.lu/lookup/sha256/",                      "desc": "NSRL-based known-good hash lookup (free, no key)",    "tags": ["hash"]},
+        {"name": "MalwareBazaar",    "url": "https://bazaar.abuse.ch/browse.php?search=",                      "desc": "Community malicious file sharing & search",           "tags": ["hash","malware"]},
+    ],
+    "📧 Email & Breach": [
+        {"name": "HaveIBeenPwned",   "url": "https://haveibeenpwned.com/",                                     "desc": "Check email in data breaches",                        "tags": ["email","breach"], "skipSearch": _NAV_SKIP},
+        {"name": "Breach.VIP",       "url": "https://breach.vip/",                                             "desc": "Free breach database search engine",                  "tags": ["email","breach"], "skipSearch": _NAV_SKIP},
+        {"name": "XposedOrNot",      "url": "https://xposedornot.com/xposed/#",                                "desc": "Email breach check (free)",                           "tags": ["email","breach"]},
+        {"name": "Email Hunter",     "url": "https://hunter.io/search/",                                       "desc": "Find emails for a domain",                           "tags": ["email","domain"]},
+        {"name": "Epieos",           "url": "https://epieos.com/?q=",                                         "desc": "Email → linked accounts & social lookup",             "tags": ["email"]},
+        {"name": "BreachDirectory",  "url": "https://breachdirectory.org/",                                    "desc": "Check email/username compromise",                     "tags": ["email","breach"], "skipSearch": _NAV_SKIP},
+        {"name": "LeakCheck",        "url": "https://leakcheck.io/",                                           "desc": "Check leaked credentials",                           "tags": ["email","breach"], "skipSearch": _NAV_SKIP},
+        {"name": "EmailRep",         "url": "https://emailrep.io/",                                            "desc": "Email reputation lookup",                            "tags": ["email"], "skipSearch": _NAV_SKIP},
+        {"name": "Alerts Bar",       "url": "https://www.alerts.bar/",                                        "desc": "Compromised credentials & breach monitoring",         "tags": ["email","breach"], "skipSearch": _NAV_SKIP},
+        {"name": "LeakPeek",         "url": "https://leakpeek.com/",                                          "desc": "Search 8B+ public records for leaks",                "tags": ["email","breach"], "skipSearch": _NAV_SKIP},
+        {"name": "ProxyNova COMB",   "url": "https://www.proxynova.com/tools/comb/",                          "desc": "Search compromised combo lists",                      "tags": ["breach"], "skipSearch": _NAV_SKIP},
+        {"name": "MX Blacklist",     "url": "https://mxtoolbox.com/SuperTool.aspx?action=blacklist%3a",        "desc": "Check if domain is blacklisted",                      "tags": ["email","dns"]},
+        {"name": "Validate Email",   "url": "https://validateemailaddress.org/",                               "desc": "Validate email address syntax & existence",           "tags": ["email"], "skipSearch": _NAV_SKIP},
+    ],
+    "📬 Email Headers": [
+        {"name": "RFC822 Parser",    "url": "https://www.whatismyip.com/email-header-analyzer/",               "desc": "Email header analyzer & RFC822 parser",              "tags": ["email header"], "skipSearch": _NAV_SKIP},
+        {"name": "Mailheader.org",   "url": "https://mailheader.org/",                                        "desc": "Online email header parser & spam analysis",          "tags": ["email header"], "skipSearch": _NAV_SKIP},
+        {"name": "Google MsgHeader", "url": "https://toolbox.googleapps.com/apps/messageheader/",              "desc": "Google Message Header Analyzer",                     "tags": ["email header"], "skipSearch": _NAV_SKIP},
+        {"name": "Azure MHA",        "url": "https://mha.azurewebsites.net/",                                  "desc": "Microsoft email header analyzer",                    "tags": ["email header"], "skipSearch": _NAV_SKIP},
+        {"name": "GlockApps",        "url": "https://glockapps.com/domain-checker/?domain=",                   "desc": "DMARC / SPF / DKIM domain protection check",         "tags": ["email","dmarc","spf"]},
+    ],
+    "🏗️ Attack Surface": [
+        {"name": "Censys",           "url": "https://search.censys.io/search?resource=hosts&sort=RELEVANCE&per_page=25&virtual_hosts=EXCLUDE&q=", "desc": "Search IPs, protocols, certificates", "tags": ["ip","url","attack surface"]},
+        {"name": "Netcraft",         "url": "https://searchdns.netcraft.com/?restriction=site+contains&host=","desc": "Domain technology fingerprinting",                    "tags": ["url","attack surface"]},
+        {"name": "WhatCMS",          "url": "https://whatcms.org/?s=",                                        "desc": "Identify CMS of a website",                          "tags": ["url","cms"]},
+        {"name": "driftnet",         "url": "https://driftnet.io/search/summary?t=search-term%3A%3Ahas+prefix%3A","desc": "Deep domain/IP connections",                      "tags": ["url","ip","cidr"]},
+        {"name": "Web Check",        "url": "https://web-check.xyz/check/",                                   "desc": "All-in-one OSINT website analyzer",                  "tags": ["url","ip"]},
+        {"name": "SilentPush",       "url": "https://explore.silentpush.com/enrichment/domain/",               "desc": "Domain / IP / ASN enrichment",                      "tags": ["ip","url","asn"]},
+        {"name": "FullHunt",         "url": "https://fullhunt.io/",                                           "desc": "Expose your attack surface",                         "tags": ["url","ip"], "skipSearch": _NAV_SKIP},
+        {"name": "Netlas",           "url": "https://app.netlas.io/",                                         "desc": "Discover, scan and monitor online assets",           "tags": ["url","ip"], "skipSearch": _NAV_SKIP},
+        {"name": "ZoomEye",          "url": "https://www.zoomeye.ai/",                                        "desc": "Cyberspace search engine for assets & vulns",        "tags": ["url","ip"], "skipSearch": _NAV_SKIP},
+        {"name": "Shodan",           "url": "https://www.shodan.io/search?query=",                            "desc": "Internet of Everything search engine",               "tags": ["ip","iot"]},
+    ],
+    "🐛 Vulnerabilities": [
+        {"name": "NVD / NIST",       "url": "https://nvd.nist.gov/",                                          "desc": "National Vulnerability Database",                     "tags": ["cve"], "skipSearch": _NAV_SKIP},
+        {"name": "CVE.org",          "url": "https://www.cve.org/",                                           "desc": "Official CVE database by MITRE",                      "tags": ["cve"], "skipSearch": _NAV_SKIP},
+        {"name": "CISA KEV",         "url": "https://www.cisa.gov/known-exploited-vulnerabilities-catalog",    "desc": "CISA known exploited vulnerabilities catalog",       "tags": ["cve"], "skipSearch": _NAV_SKIP},
+        {"name": "ExploitDB",        "url": "https://www.exploit-db.com/",                                    "desc": "Exploit database",                                   "tags": ["cve","exploit"], "skipSearch": _NAV_SKIP},
+        {"name": "Vulners",          "url": "https://vulners.com/",                                           "desc": "Search 3M+ vulnerabilities & exploits",              "tags": ["cve","exploit"], "skipSearch": _NAV_SKIP},
+        {"name": "CVE Details",      "url": "https://www.cvedetails.com/",                                    "desc": "CVE search with vendor/product breakdown",           "tags": ["cve"], "skipSearch": _NAV_SKIP},
+        {"name": "AttackerKB",       "url": "https://attackerkb.com/activity-feed",                           "desc": "Vulnerability insights — attacker perspective",      "tags": ["cve"], "skipSearch": _NAV_SKIP},
+        {"name": "CVE Sky (GN)",     "url": "https://cvesky.labs.greynoise.io/",                              "desc": "GreyNoise CVE exploitation data",                     "tags": ["cve","vendor"], "skipSearch": _NAV_SKIP},
+    ],
+    "🦠 Malware Analysis": [
+        {"name": "ANY.RUN",          "url": "https://app.any.run/",                                           "desc": "Interactive malware sandbox (Win/Linux/Android)",     "tags": ["malware","sandbox"], "skipSearch": _NAV_SKIP},
+        {"name": "Joe Sandbox",      "url": "https://www.joesandbox.com/",                                    "desc": "Deep malware analysis sandbox",                      "tags": ["malware","sandbox"], "skipSearch": _NAV_SKIP},
+        {"name": "Cuckoo (CERT.ee)", "url": "https://cuckoo.cert.ee/",                                        "desc": "Open-source automated malware analysis",             "tags": ["malware","sandbox"], "skipSearch": _NAV_SKIP},
+        {"name": "Docguard.io",      "url": "https://www.docguard.io/",                                       "desc": "Document-based malware analysis",                    "tags": ["malware","upload"], "skipSearch": _NAV_SKIP},
+        {"name": "FileScan.IO",      "url": "https://www.filescan.io/",                                       "desc": "File scanning & behavioral malware analysis",        "tags": ["malware","upload"], "skipSearch": _NAV_SKIP},
+        {"name": "CAPE Sandbox",     "url": "https://capesandbox.com/",                                       "desc": "CAPE custom malware analysis sandbox",              "tags": ["malware","sandbox"], "skipSearch": _NAV_SKIP},
+        {"name": "YARAify",          "url": "https://yaraify.abuse.ch/scan/",                                 "desc": "Hunt across abuse.ch with YARA rules",              "tags": ["yara","malware"], "skipSearch": _NAV_SKIP},
+        {"name": "Polyswarm",        "url": "https://polyswarm.network/scan",                                 "desc": "Scan files / URLs for threats",                     "tags": ["malware","url"], "skipSearch": _NAV_SKIP},
+        {"name": "Kunai Sandbox",    "url": "https://sandbox.kunai.rocks/",                                   "desc": "Linux malware sandbox (eBPF-based)",                "tags": ["linux","malware","sandbox"], "skipSearch": _NAV_SKIP},
+    ],
+    "🧪 Malware Feeds": [
+        {"name": "Abuse.ch",         "url": "https://abuse.ch/",                                              "desc": "Swiss open threat intelligence project",            "tags": ["ioc","malware"], "skipSearch": _NAV_SKIP},
+        {"name": "MalwareBazaar",    "url": "https://bazaar.abuse.ch/",                                       "desc": "Malicious file sharing community",                  "tags": ["ioc","malware"], "skipSearch": _NAV_SKIP},
+        {"name": "URLhaus Feed",     "url": "https://urlhaus.abuse.ch/",                                      "desc": "Malicious URL distribution tracker",               "tags": ["ioc","url"], "skipSearch": _NAV_SKIP},
+        {"name": "ThreatFox Feed",   "url": "https://threatfox.abuse.ch/",                                    "desc": "Community-driven IOC sharing platform",            "tags": ["ioc"], "skipSearch": _NAV_SKIP},
+        {"name": "Feodo Tracker",    "url": "https://feodotracker.abuse.ch/",                                  "desc": "C2 associated with Feodo/TrickBot/QakBot/Emotet",  "tags": ["ioc","c2"], "skipSearch": _NAV_SKIP},
+        {"name": "SSL Blacklist",    "url": "https://sslbl.abuse.ch/",                                        "desc": "Suspicious SSL certs & JA3 fingerprints",          "tags": ["ioc","ssl"], "skipSearch": _NAV_SKIP},
+        {"name": "Malware Traffic",  "url": "https://www.malware-traffic-analysis.net/",                       "desc": "PCAPs & write-ups from real malware captures",     "tags": ["ioc","pcap"], "skipSearch": _NAV_SKIP},
+        {"name": "Ransomware.live",  "url": "https://www.ransomware.live/",                                   "desc": "Live ransomware leak site tracker",                "tags": ["ransomware"], "skipSearch": _NAV_SKIP},
+    ],
+    "🎣 Phishing Analysis": [
+        {"name": "PhishTank",        "url": "https://www.phishtank.com/search.php?valid=y&active=y&Search=Search&url=", "desc": "Phishing URL database check",                "tags": ["phishing","url"]},
+        {"name": "CheckPhish",       "url": "https://checkphish.bolster.ai/",                                 "desc": "AI-powered phishing URL analysis",                  "tags": ["phishing","url"], "skipSearch": _NAV_SKIP},
+        {"name": "OpenPhish",        "url": "https://openphish.com/",                                         "desc": "Active phishing feeds",                            "tags": ["phishing"], "skipSearch": _NAV_SKIP},
+        {"name": "PhishStats",       "url": "https://phishstats.info/",                                       "desc": "Phishing statistics & searchable database",        "tags": ["phishing"], "skipSearch": _NAV_SKIP},
+        {"name": "Zscaler Zulu",     "url": "https://zulu.zscaler.com/",                                      "desc": "Zulu URL Risk Analyzer",                           "tags": ["url","phishing"], "skipSearch": _NAV_SKIP},
+        {"name": "IsLegitSite",      "url": "https://www.islegitsite.com/check/",                              "desc": "Check if a website is legit or a scam",           "tags": ["url","phishing"]},
+        {"name": "URLVoid",          "url": "https://www.urlvoid.com/scan/",                                   "desc": "Website online reputation / safety check",        "tags": ["url","phishing"]},
+        {"name": "BrightCloud",      "url": "https://www.brightcloud.com/tools/url-ip-lookup.php",            "desc": "URL / IP reputation via BrightCloud",              "tags": ["url","ip"], "skipSearch": _NAV_SKIP},
+        {"name": "Palo Alto URL",    "url": "https://urlfiltering.paloaltonetworks.com/",                     "desc": "Palo Alto URL categories & reputation",           "tags": ["url"], "skipSearch": _NAV_SKIP},
+    ],
+    "👥 Social Media & People": [
+        {"name": "WhatsMyName",      "url": "https://whatsmyname.app",                                        "desc": "Find usernames across 500+ websites",              "tags": ["username","social"], "skipSearch": _NAV_SKIP},
+        {"name": "NameChk",          "url": "https://namechk.com",                                            "desc": "Username availability across social networks",     "tags": ["username","social"], "skipSearch": _NAV_SKIP},
+        {"name": "Epieos",           "url": "https://epieos.com/?q=",                                        "desc": "Email → linked accounts lookup",                  "tags": ["email","social"]},
+        {"name": "FaceCheck.ID",     "url": "https://facecheck.id/",                                         "desc": "Facial recognition search engine",               "tags": ["image","face"], "skipSearch": _NAV_SKIP},
+        {"name": "TinEye",           "url": "https://tineye.com/",                                           "desc": "Reverse image search engine",                    "tags": ["image"], "skipSearch": _NAV_SKIP},
+        {"name": "TrueCaller",       "url": "https://www.truecaller.com/",                                    "desc": "Phone number lookup & spam call protection",     "tags": ["phone","people"], "skipSearch": _NAV_SKIP},
+        {"name": "IDCrawl",          "url": "https://www.idcrawl.com/username-search",                       "desc": "Social media profiles by username",              "tags": ["username","social"], "skipSearch": _NAV_SKIP},
+        {"name": "osint.rocks",      "url": "https://osint.rocks/",                                          "desc": "Sherlock & Maigret username search",             "tags": ["username","social"], "skipSearch": _NAV_SKIP},
+        {"name": "Minerva OSINT",    "url": "https://minervaosint.com/",                                      "desc": "Find social accounts by email",                  "tags": ["email","social"], "skipSearch": _NAV_SKIP},
+        {"name": "SynapsInt",        "url": "https://synapsint.com/",                                        "desc": "Multi-source OSINT: IP, URL, email, Twitter",    "tags": ["ip","url","email"], "skipSearch": _NAV_SKIP},
+        {"name": "Blockchair",       "url": "https://blockchair.com/",                                       "desc": "Multi-blockchain explorer & analytics",          "tags": ["crypto","blockchain"], "skipSearch": _NAV_SKIP},
+        {"name": "IntelX Facebook",  "url": "https://intelx.io/tools?tab=facebook",                         "desc": "Facebook search via IntelligenceX",              "tags": ["social","facebook"], "skipSearch": _NAV_SKIP},
+        {"name": "Bitcoin Who's Who","url": "https://www.bitcoinwhoswho.com/",                               "desc": "Bitcoin wallet address lookup & scammer reports", "tags": ["crypto","bitcoin"], "skipSearch": _NAV_SKIP},
+    ],
+    "🔧 Utilities": [
+        {"name": "CyberChef",        "url": "https://gchq.github.io/CyberChef/",                              "desc": "Encode / decode / encrypt / decrypt data",        "tags": ["encode","decode","crypto"], "skipSearch": _NAV_SKIP},
+        {"name": "Uncoder IO",       "url": "https://tdm.socprime.com/uncoder-ai",                            "desc": "Translate detection rules between SIEMs",        "tags": ["sigma","siem"], "skipSearch": _NAV_SKIP},
+        {"name": "DorkSearch",       "url": "https://dorksearch.com/",                                        "desc": "Google dork search builder",                     "tags": ["search","dork"], "skipSearch": _NAV_SKIP},
+        {"name": "CrackStation",     "url": "https://crackstation.net/",                                      "desc": "Free password hash cracker",                     "tags": ["hash","password"], "skipSearch": _NAV_SKIP},
+        {"name": "Regex101",         "url": "https://regex101.com/",                                         "desc": "Regular expression tester & debugger",           "tags": ["regex"], "skipSearch": _NAV_SKIP},
+        {"name": "Browserling",      "url": "https://www.browserling.com/",                                   "desc": "Browser in the cloud — test URLs safely",        "tags": ["url","browser"], "skipSearch": _NAV_SKIP},
+        {"name": "GrayHatWarfare",   "url": "https://buckets.grayhatwarfare.com/",                            "desc": "Open / misconfigured S3 buckets search",        "tags": ["s3","cloud"], "skipSearch": _NAV_SKIP},
+        {"name": "DOCX Metadata",    "url": "https://products.groupdocs.app/metadata/docx",                   "desc": "View / edit DOCX file metadata",                "tags": ["metadata","upload"], "skipSearch": _NAV_SKIP},
+        {"name": "Steganography",    "url": "https://stylesuxx.github.io/steganography/",                     "desc": "Encode / decode hidden data in images",         "tags": ["steganography"], "skipSearch": _NAV_SKIP},
+        {"name": "AADInternals",     "url": "https://aadinternals.com/osint/",                                "desc": "Azure AD tenant OSINT tool",                    "tags": ["azure","tenant","email"], "skipSearch": _NAV_SKIP},
+        {"name": "Ransomware DB",    "url": "https://www.ransom-db.com/",                                     "desc": "Searchable ransomware leak database",           "tags": ["ransomware"], "skipSearch": _NAV_SKIP},
+        {"name": "OCCRP Aleph",      "url": "https://data.occrp.org/",                                       "desc": "Leaks & databases for financial tracking",      "tags": ["leaks","data breach"], "skipSearch": _NAV_SKIP},
+        {"name": "Ransomware.live",  "url": "https://www.ransomware.live/",                                   "desc": "Live ransomware leak site tracker",             "tags": ["ransomware"], "skipSearch": _NAV_SKIP},
+    ],
+    "🤖 AI Tools": [
+        {"name": "ChatGPT",          "url": "https://chatgpt.com/",                                           "desc": "OpenAI GPT conversational AI",                  "tags": ["ai"], "skipSearch": _NAV_SKIP},
+        {"name": "Gemini",           "url": "https://gemini.google.com/",                                     "desc": "Google Gemini AI assistant",                    "tags": ["ai"], "skipSearch": _NAV_SKIP},
+        {"name": "Claude",           "url": "https://claude.ai/",                                             "desc": "Anthropic Claude AI for research",              "tags": ["ai"], "skipSearch": _NAV_SKIP},
+        {"name": "Copilot",          "url": "https://copilot.microsoft.com/",                                 "desc": "Microsoft AI companion",                        "tags": ["ai"], "skipSearch": _NAV_SKIP},
+        {"name": "Perplexity",       "url": "https://www.perplexity.ai/",                                     "desc": "AI-powered real-time research engine",          "tags": ["ai","research"], "skipSearch": _NAV_SKIP},
+        {"name": "NotebookLM",       "url": "https://notebooklm.google.com/",                                 "desc": "Google AI research notebook",                   "tags": ["ai","research"], "skipSearch": _NAV_SKIP},
+        {"name": "Consensus",        "url": "https://consensus.app/",                                         "desc": "AI tool for scientific paper consensus",        "tags": ["ai","research"], "skipSearch": _NAV_SKIP},
+    ],
+}
+
+# ══════════════════════════════════════════════════════════════════
 # GUI APPLICATION
 # ══════════════════════════════════════════════════════════════════
 class OSINTApp(ctk.CTk):
@@ -1181,7 +1582,7 @@ class OSINTApp(ctk.CTk):
         self._ph_active_tab = "summary"
         # Shared thread pool for all network calls
         self._executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="osint")
-        self.title("⚡ OSINT MultiSearch v9")
+        self.title("⚡ OSINT MultiSearch v10")
         try: self.iconbitmap(os.path.join(_SCRIPT_DIR, "myicon.ico"))
         except Exception: pass
         self.geometry("1380x860")
@@ -1193,7 +1594,7 @@ class OSINTApp(ctk.CTk):
         # ── Header ──────────────────────────────────────────────────
         hdr = ctk.CTkFrame(self, height=56, corner_radius=12)
         hdr.pack(fill="x", padx=14, pady=(14,6))
-        ctk.CTkLabel(hdr, text="⚡ OSINT MultiSearch  v9",
+        ctk.CTkLabel(hdr, text="⚡ OSINT MultiSearch  v10",
                      font=("Segoe UI",22,"bold")).pack(side="left", padx=16)
 
         # Mode toggle (replaces dark/light toggle)
@@ -1274,6 +1675,11 @@ class OSINTApp(ctk.CTk):
                       command=self._open_tabs, height=32).pack(fill="x", padx=12, pady=4)
         ctk.CTkButton(left, text="💾  Export to CSV",
                       command=self._export_csv, height=32).pack(fill="x", padx=12, pady=4)
+        ctk.CTkButton(left, text="📄  Export HTML Report",
+                      command=self._export_html_report, height=32).pack(fill="x", padx=12, pady=4)
+        ctk.CTkButton(left, text="🌐  OSINT Navigator",
+                      command=lambda: self.tabs.set("🌐 OSINT Navigator"), height=32,
+                      fg_color="#1a3a6a", hover_color="#1e5a9a").pack(fill="x", padx=12, pady=4)
         ctk.CTkButton(left, text="🗑️  Clear All",
                       command=self._clear_all, height=28,
                       fg_color="transparent", border_width=1).pack(fill="x", padx=12, pady=4)
@@ -1281,13 +1687,14 @@ class OSINTApp(ctk.CTk):
         # Tabs
         self.tabs = ctk.CTkTabview(main, corner_radius=12)
         self.tabs.pack(side="left", fill="both", expand=True, pady=0)
-        for tab in ["📊 Results","🤖 AI Summary","🔗 OSINT URLs","🏖️ Sandbox","⚙️ Settings"]:
+        for tab in ["📊 Results","🤖 AI Summary","🔗 OSINT URLs","🏖️ Sandbox","🌐 OSINT Navigator","⚙️ Settings"]:
             self.tabs.add(tab)
 
         self._build_results_tab()
         self._build_ai_tab()
         self._build_urls_tab()
         self._build_sandbox_tab()
+        self._build_navigator_tab()
         self._build_settings_tab()
 
     def _build_results_tab(self):
@@ -1348,6 +1755,138 @@ class OSINTApp(ctk.CTk):
                                               text_color="gray", font=("Segoe UI",12))
         self.sandbox_img_label.pack(fill="both", expand=True, padx=6, pady=6)
 
+    def _build_navigator_tab(self):
+        t = self.tabs.tab("🌐 OSINT Navigator")
+        _COLS = 5
+
+        # ── Top control bar ──────────────────────────────────────────
+        ctrl = ctk.CTkFrame(t, fg_color="transparent")
+        ctrl.pack(fill="x", padx=8, pady=(6,2))
+
+        ctk.CTkLabel(ctrl, text="IOC:", font=("Segoe UI",12,"bold")).pack(side="left", padx=(0,4))
+        self.nav_ioc = ctk.CTkEntry(ctrl, width=240, placeholder_text="IP / Domain / Hash / URL…", height=30)
+        self.nav_ioc.pack(side="left")
+        ctk.CTkButton(ctrl, text="⬆ Sync from Lookup", width=130, height=30,
+                      command=self._nav_sync_ioc, fg_color="#1a6a3a", hover_color="#1e8a4a").pack(side="left", padx=6)
+
+        ctk.CTkButton(ctrl, text="⊟ Collapse All", width=100, height=28,
+                      command=lambda: self._nav_set_all(False),
+                      fg_color="transparent", border_width=1).pack(side="right", padx=2)
+        ctk.CTkButton(ctrl, text="⊞ Expand All", width=100, height=28,
+                      command=lambda: self._nav_set_all(True),
+                      fg_color="transparent", border_width=1).pack(side="right", padx=2)
+        self.nav_filter = ctk.CTkEntry(ctrl, width=190, placeholder_text="Filter tools…", height=28)
+        self.nav_filter.pack(side="right", padx=(4,0))
+        ctk.CTkLabel(ctrl, text="Filter:", font=("Segoe UI",11)).pack(side="right", padx=(12,2))
+        self.nav_filter.bind("<KeyRelease>", lambda e: self._nav_filter())
+
+        # ── Hint label ───────────────────────────────────────────────
+        ctk.CTkLabel(t,
+            text="🔶 = opens directly (no IOC)   ·   All other cards append your IOC to the URL and open in browser",
+            font=("Segoe UI",10), text_color="gray").pack(anchor="w", padx=10, pady=(0,2))
+
+        # ── Scrollable content ───────────────────────────────────────
+        self.nav_scroll = ctk.CTkScrollableFrame(t, corner_radius=8)
+        self.nav_scroll.pack(fill="both", expand=True, padx=8, pady=(0,6))
+
+        self._nav_sections = {}  # cat_name → {wrapper, header, content, buttons[(btn,tool)], open}
+
+        for cat_name, tools in NAV_TOOLS.items():
+            total = len(tools)
+            wrapper = ctk.CTkFrame(self.nav_scroll, fg_color="transparent")
+            wrapper.pack(fill="x", pady=(4,0))
+
+            # Header toggle button
+            hdr = ctk.CTkButton(
+                wrapper,
+                text=f"▾  {cat_name}  ({total} tools)",
+                fg_color="#1a2a3a", hover_color="#1e3a5a",
+                text_color="#61afef", font=("Segoe UI",12,"bold"),
+                anchor="w", corner_radius=6, height=30,
+                command=lambda cn=cat_name: self._nav_toggle(cn))
+            hdr.pack(fill="x")
+
+            # Content frame (grid of tool buttons)
+            cf = ctk.CTkFrame(wrapper, fg_color="#1e1e2e", corner_radius=6)
+            cf.pack(fill="x", pady=(2,0))
+
+            buttons = []
+            for i, tool in enumerate(tools):
+                skip = tool.get("skipSearch", False)
+                label = ("🔶 " if skip else "") + tool["name"]
+                def _click(t=tool):
+                    ioc = self.nav_ioc.get().strip()
+                    url = t.get("url","")
+                    if t.get("skipSearch") or not ioc:
+                        webbrowser.open_new_tab(url)
+                    else:
+                        webbrowser.open_new_tab(url + ioc)
+                btn = ctk.CTkButton(
+                    cf, text=label, height=28, corner_radius=5,
+                    fg_color="#252535", hover_color="#2a3a5a",
+                    font=("Segoe UI",10), anchor="w",
+                    command=_click)
+                row, col = divmod(i, _COLS)
+                btn.grid(row=row, column=col, padx=3, pady=3, sticky="ew")
+                buttons.append((btn, tool))
+
+            for c in range(_COLS):
+                cf.columnconfigure(c, weight=1)
+
+            self._nav_sections[cat_name] = {
+                "wrapper": wrapper, "header": hdr, "content": cf,
+                "buttons": buttons, "open": True
+            }
+
+    def _nav_toggle(self, cat_name):
+        sec = self._nav_sections[cat_name]
+        sec["open"] = not sec["open"]
+        n = len(sec["buttons"])
+        if sec["open"]:
+            sec["content"].pack(fill="x", pady=(2,0))
+            sec["header"].configure(text=f"▾  {cat_name}  ({n} tools)")
+        else:
+            sec["content"].pack_forget()
+            sec["header"].configure(text=f"▸  {cat_name}  ({n} tools)")
+
+    def _nav_set_all(self, open_state):
+        for cat_name, sec in self._nav_sections.items():
+            n = len(sec["buttons"])
+            sec["open"] = open_state
+            if open_state:
+                sec["content"].pack(fill="x", pady=(2,0))
+                sec["header"].configure(text=f"▾  {cat_name}  ({n} tools)")
+            else:
+                sec["content"].pack_forget()
+                sec["header"].configure(text=f"▸  {cat_name}  ({n} tools)")
+
+    def _nav_filter(self):
+        _COLS = 5
+        query = self.nav_filter.get().strip().lower()
+        for cat_name, sec in self._nav_sections.items():
+            visible = 0
+            for btn, tool in sec["buttons"]:
+                match = (not query
+                         or query in tool["name"].lower()
+                         or query in tool.get("desc","").lower()
+                         or any(query in tag.lower() for tag in tool.get("tags",[])))
+                if match:
+                    r, c = divmod(visible, _COLS)
+                    btn.grid(row=r, column=c, padx=3, pady=3, sticky="ew")
+                    visible += 1
+                else:
+                    btn.grid_remove()
+            # Update header count
+            label = f"{'▾' if sec['open'] else '▸'}  {cat_name}  ({visible} tools)"
+            sec["header"].configure(text=label)
+
+    def _nav_sync_ioc(self):
+        raw = self.ioc_entry.get("1.0","end").strip().splitlines()
+        ioc = self.osint.clean_ioc(raw[0].strip()) if raw else ""
+        self.nav_ioc.delete(0,"end")
+        if ioc: self.nav_ioc.insert(0, ioc)
+        self.tabs.set("🌐 OSINT Navigator")
+
     def _build_settings_tab(self):
         t = self.tabs.tab("⚙️ Settings")
         scroll = ctk.CTkScrollableFrame(t, corner_radius=8)
@@ -1369,6 +1908,9 @@ class OSINTApp(ctk.CTk):
                           "https://auth.abuse.ch/",                                                   "Free — register at auth.abuse.ch"),
             ("joe_key",   "Joe Sandbox",          "https://www.joesecurity.org",                     "Paid / free trial"),
             ("gemini_key","Google Gemini AI",      "https://aistudio.google.com/app/apikey",           "Free tier available"),
+            ("ipqs",      "IPQualityScore",        "https://www.ipqualityscore.com/create-account",    "Free 200 req/day — IPs, Emails, URLs, Domains"),
+            ("criminalip","CriminalIP",            "https://www.criminalip.io/signup",                 "Free tier — IP reputation & attack surface"),
+            ("pulsedive", "Pulsedive",             "https://pulsedive.com/register/",                  "Free tier — IPs, Domains, Hashes, URLs"),
         ]
         for key, label, url, note in services:
             frame = ctk.CTkFrame(scroll, corner_radius=8, border_width=1)
@@ -1417,7 +1959,8 @@ class OSINTApp(ctk.CTk):
         whois_s = "✅ python-whois" if WHOIS_AVAILABLE else "❌ python-whois  (pip install python-whois)"
         dns_s   = "✅ dnspython"    if DNS_AVAILABLE   else "❌ dnspython     (pip install dnspython)"
         msg_s   = "✅ extract-msg"  if HAS_MSG         else "❌ extract-msg   (pip install extract-msg)"
-        ctk.CTkLabel(lib_frame, text=f"  {whois_s}\n  {dns_s}\n  {msg_s}",
+        free_s  = "✅ Free sources  (no key): ip-api.com · CIRCL HashLookup · PhishTank · DNS · WHOIS"
+        ctk.CTkLabel(lib_frame, text=f"  {whois_s}\n  {dns_s}\n  {msg_s}\n  {free_s}",
                      font=("Consolas",11), justify="left").pack(anchor="w", padx=12, pady=(0,10))
 
     def _toggle_key_visibility(self):
@@ -1460,14 +2003,19 @@ class OSINTApp(ctk.CTk):
             # ── Parallel API checks ──────────────────────────────────
             futures = {}
             if ioc_type == "email":
-                futures["xon"] = self._executor.submit(self.osint.check_hibp, cleaned)
+                futures["xon"]  = self._executor.submit(self.osint.check_hibp, cleaned)
+                futures["ipqs"] = self._executor.submit(self.osint.check_ipqs, cleaned, "email")
+                futures["bvip"] = self._executor.submit(self.osint.check_breachvip, cleaned, "email")
             else:
-                futures["vt"]  = self._executor.submit(self.osint.check_virustotal, cleaned, ioc_type)
-                futures["otx"] = self._executor.submit(self.osint.check_otx, cleaned, ioc_type)
+                futures["vt"]   = self._executor.submit(self.osint.check_virustotal, cleaned, ioc_type)
+                futures["otx"]  = self._executor.submit(self.osint.check_otx, cleaned, ioc_type)
+                futures["pd"]   = self._executor.submit(self.osint.check_pulsedive, cleaned, ioc_type)
                 if ioc_type == "ip":
                     futures["abip"] = self._executor.submit(self.osint.check_abuseipdb, cleaned)
                     futures["gn"]   = self._executor.submit(self.osint.check_greynoise, cleaned)
                     futures["shd"]  = self._executor.submit(self.osint.check_shodan, cleaned)
+                    futures["cip"]  = self._executor.submit(self.osint.check_criminalip, cleaned)
+                    futures["ipqs"] = self._executor.submit(self.osint.check_ipqs, cleaned, "ip")
             # ── Parallel free checks ─────────────────────────────────
             if ioc_type == "ip":
                 futures["geo"]  = self._executor.submit(self.osint.check_ipapi, cleaned)
@@ -1479,10 +2027,13 @@ class OSINTApp(ctk.CTk):
                 futures["wh"]   = self._executor.submit(self.osint.check_whois, cleaned)
                 futures["tf"]   = self._executor.submit(self.osint.check_threatfox, cleaned)
                 futures["uh"]   = self._executor.submit(self.osint.check_urlhaus, cleaned, ioc_type)
+                futures["pt"]   = self._executor.submit(self.osint.check_phishtank, cleaned)
+                futures["ipqs"] = self._executor.submit(self.osint.check_ipqs, cleaned, "domain")
             elif ioc_type == "hash":
                 futures["mb"]   = self._executor.submit(self.osint.check_malwarebazaar, cleaned)
                 futures["tf"]   = self._executor.submit(self.osint.check_threatfox, cleaned)
                 futures["uh"]   = self._executor.submit(self.osint.check_urlhaus, cleaned, ioc_type)
+                futures["hl"]   = self._executor.submit(self.osint.check_hashlookup, cleaned)
             # Gather results (with per-future timeout)
             results = {}
             for key, fut in futures.items():
@@ -1502,96 +2053,149 @@ class OSINTApp(ctk.CTk):
             uh   = results.get("uh")
             mb   = results.get("mb")
             tf   = results.get("tf")
+            pd   = results.get("pd")
+            cip  = results.get("cip")
+            ipqs = results.get("ipqs")
+            hl   = results.get("hl")
+            pt   = results.get("pt")
+            bvip = results.get("bvip")
             # ── Render API results ───────────────────────────────────
-            def _ins_api(ic=cleaned, it=ioc_type, v=vt, a=abip, g=gn, o=otx, s=shd, h=hibp):
+            def _ins_api(ic=cleaned, it=ioc_type, v=vt, a=abip, g=gn, o=otx, s=shd, h=hibp,
+                         p=pd, ci=cip, iq=ipqs, bv=bvip):
                 W = "═"*62
                 self.results_text.insert("end", f"\n{W}\n  IOC: {ic}  [{it.upper()}]\n{W}\n")
+                # helper: only show a section when there's real data (no error, has content)
+                def _has(d, *keys): return d and not any(d.get(k) for k in keys if "error" in k) and any(d.get(k) for k in keys if "error" not in k)
+
                 if it == "email":
-                    if h is not None:
+                    # XposedOrNot — always show (core breach source)
+                    if h is not None and not h.get("xon_error"):
                         self.results_text.insert("end", "\n▸ Breach Check  (XposedOrNot — free)\n")
-                        if h.get("xon_error"):
-                            self.results_text.insert("end", f"  {h['xon_error']}\n")
-                        else:
-                            self.results_text.insert("end", f"  {h['xon_verdict']}\n")
-                            for br in h.get("breaches",[])[:15]:
-                                line = f"  🔴 {br['name']}"
-                                if br.get("domain"):   line += f"  [{br['domain']}]"
-                                if br.get("date"):     line += f"  ({br['date']})"
-                                if br.get("records"):  line += f"  ~{br['records']:,} records"
-                                self.results_text.insert("end", line + "\n")
-                                if br.get("data_classes"):
-                                    self.results_text.insert("end", f"     Data: {br['data_classes']}\n")
-                                if br.get("industry"):
-                                    self.results_text.insert("end", f"     Industry: {br['industry']}  ·  Password risk: {br.get('password_risk','?')}\n")
+                        self.results_text.insert("end", f"  {h['xon_verdict']}\n")
+                        for br in h.get("breaches",[])[:15]:
+                            line = f"  🔴 {br['name']}"
+                            if br.get("domain"):   line += f"  [{br['domain']}]"
+                            if br.get("date"):     line += f"  ({br['date']})"
+                            if br.get("records"):  line += f"  ~{br['records']:,} records"
+                            self.results_text.insert("end", line + "\n")
+                            if br.get("data_classes"):
+                                self.results_text.insert("end", f"     Data: {br['data_classes']}\n")
+                            if br.get("industry"):
+                                self.results_text.insert("end", f"     Industry: {br['industry']}  ·  Password risk: {br.get('password_risk','?')}\n")
+                    # IPQS email — only show if has a real verdict with content
+                    if iq is not None and not iq.get("ipqs_error") and iq.get("ipqs_verdict"):
+                        self.results_text.insert("end", "\n▸ IPQualityScore  (Email)\n")
+                        self.results_text.insert("end",
+                            f"  {iq.get('ipqs_verdict','')}  ·  Fraud Score: {iq.get('ipqs_fraud_score','')}\n"
+                            f"  Disposable: {iq.get('ipqs_disposable','?')}\n")
+                    # Breach.VIP — only show if found breaches
+                    if bv is not None and not bv.get("bvip_error") and bv.get("bvip_count",0) > 0:
+                        self.results_text.insert("end", "\n▸ Breach.VIP  (free)\n")
+                        self.results_text.insert("end", f"  {bv['bvip_verdict']}\n")
+                        for item in bv.get("bvip_results", [])[:20]:
+                            cats = item.get("categories","")
+                            if isinstance(cats, list): cats = ", ".join(cats)
+                            line = f"  🔴 {item['source']}"
+                            if cats: line += f"  [{cats}]"
+                            extra = item.get("extra", {})
+                            for k in ("email","username","password","ip","phone"):
+                                if extra.get(k): line += f"  {k}: {extra[k]}"
+                            self.results_text.insert("end", line + "\n")
                     return
-                if v is not None:
+                # ── VirusTotal — always show (primary signal) ──
+                if v is not None and not v.get("vt_error"):
                     self.results_text.insert("end", "\n▸ VirusTotal\n")
-                    if v.get("vt_error"):
-                        self.results_text.insert("end", f"  {v['vt_error']}\n")
-                    else:
+                    self.results_text.insert("end",
+                        f"  {v['vt_verdict']}  ·  🔴 Mal: {v['malicious']}  "
+                        f"🟡 Sus: {v['suspicious']}  🟢 OK: {v['harmless']}\n"
+                        f"  VT Score: {v['vt_score']}  ·  Last checked: {v.get('last_analysis_date') or 'n/a'}\n")
+                    if v.get("creation_date"): self.results_text.insert("end", f"  Created: {v['creation_date']}\n")
+                    if v.get("registrar"):     self.results_text.insert("end", f"  Registrar: {v['registrar']}\n")
+                    if v.get("categories"):    self.results_text.insert("end", f"  Categories: {v['categories']}\n")
+                    if v.get("last_http_code"):self.results_text.insert("end", f"  Last HTTP: {v['last_http_code']}\n")
+                    if v.get("as_owner"):      self.results_text.insert("end", f"  AS Owner: {v['as_owner']}  ASN: {v.get('asn','')}\n")
+                    if v.get("network"):       self.results_text.insert("end", f"  Network: {v['network']}\n")
+                    if v.get("threat_label"):  self.results_text.insert("end", f"  Threat: {v['threat_label']}\n")
+                    if v.get("file_type"):
                         self.results_text.insert("end",
-                            f"  {v['vt_verdict']}  ·  🔴 Mal: {v['malicious']}  "
-                            f"🟡 Sus: {v['suspicious']}  🟢 OK: {v['harmless']}\n"
-                            f"  VT Score: {v['vt_score']}  ·  Last checked: {v.get('last_analysis_date') or 'n/a'}\n")
-                        if v.get("creation_date"): self.results_text.insert("end", f"  Created: {v['creation_date']}\n")
-                        if v.get("registrar"):     self.results_text.insert("end", f"  Registrar: {v['registrar']}\n")
-                        if v.get("categories"):    self.results_text.insert("end", f"  Categories: {v['categories']}\n")
-                        if v.get("last_http_code"):self.results_text.insert("end", f"  Last HTTP: {v['last_http_code']}\n")
-                        if v.get("as_owner"):      self.results_text.insert("end", f"  AS Owner: {v['as_owner']}  ASN: {v.get('asn','')}\n")
-                        if v.get("network"):       self.results_text.insert("end", f"  Network: {v['network']}\n")
-                        if v.get("threat_label"):  self.results_text.insert("end", f"  Threat: {v['threat_label']}\n")
-                        if v.get("file_type"):
-                            self.results_text.insert("end",
-                                f"  File: {v.get('file_names') or 'n/a'}  [{v['file_type']}]  {v.get('file_size','')}\n")
-                        if v.get("total_votes_mal") or v.get("total_votes_ok"):
-                            self.results_text.insert("end",
-                                f"  Community: 👍 {v.get('total_votes_ok',0)}  👎 {v.get('total_votes_mal',0)}"
-                                + (f"  Reputation: {v['reputation']}" if v.get("reputation") else "") + "\n")
-                if it == "ip" and a is not None:
+                            f"  File: {v.get('file_names') or 'n/a'}  [{v['file_type']}]  {v.get('file_size','')}\n")
+                    if v.get("total_votes_mal") or v.get("total_votes_ok"):
+                        self.results_text.insert("end",
+                            f"  Community: 👍 {v.get('total_votes_ok',0)}  👎 {v.get('total_votes_mal',0)}"
+                            + (f"  Reputation: {v['reputation']}" if v.get("reputation") else "") + "\n")
+                # ── AbuseIPDB — always show for IPs ──
+                if it == "ip" and a is not None and not a.get("abuse_error"):
                     self.results_text.insert("end", "\n▸ AbuseIPDB\n")
-                    if a.get("abuse_error"): self.results_text.insert("end", f"  {a['abuse_error']}\n")
-                    else:
-                        self.results_text.insert("end",
-                            f"  {a['abuse_verdict']}  ·  Score: {a['abuse_score']}%  "
-                            f"·  Reports: {a['total_reports']}  ·  Country: {a['country']}\n"
-                            f"  ISP: {a['isp']}  ·  Usage: {a['usage_type']}\n")
-                if it == "ip" and g is not None:
+                    self.results_text.insert("end",
+                        f"  {a['abuse_verdict']}  ·  Score: {a['abuse_score']}%  "
+                        f"·  Reports: {a['total_reports']}  ·  Country: {a['country']}\n"
+                        f"  ISP: {a['isp']}  ·  Usage: {a['usage_type']}\n")
+                # ── GreyNoise — always show for IPs ──
+                if it == "ip" and g is not None and not g.get("gn_error"):
                     self.results_text.insert("end", "\n▸ GreyNoise\n")
-                    if g.get("gn_error"): self.results_text.insert("end", f"  {g['gn_error']}\n")
-                    else:
-                        self.results_text.insert("end",
-                            f"  {g['gn_verdict']}  ·  Class: {g['classification']}  "
-                            f"·  Noise: {g['noise']}  ·  RIOT: {g['riot']}\n")
-                        if g.get("name"): self.results_text.insert("end", f"  Name: {g['name']}\n")
-                if it == "ip" and s is not None:
+                    self.results_text.insert("end",
+                        f"  {g['gn_verdict']}  ·  Class: {g['classification']}  "
+                        f"·  Noise: {g['noise']}  ·  RIOT: {g['riot']}\n")
+                    if g.get("name"): self.results_text.insert("end", f"  Name: {g['name']}\n")
+                # ── Shodan — only show if data returned without error ──
+                if it == "ip" and s is not None and not s.get("shodan_error") and s.get("org"):
                     self.results_text.insert("end", "\n▸ Shodan\n")
-                    if s.get("shodan_error"): self.results_text.insert("end", f"  {s['shodan_error']}\n")
-                    else:
-                        self.results_text.insert("end",
-                            f"  Org: {s['org']}  ·  Country: {s['country']}  ·  OS: {s['os']}\n"
-                            f"  Ports: {s['ports'] or 'n/a'}\n")
-                        if s.get("vulns") and s["vulns"] != "None": self.results_text.insert("end", f"  ⚠️  CVEs: {s['vulns']}\n")
-                        if s.get("hostnames"): self.results_text.insert("end", f"  Hostnames: {s['hostnames']}\n")
-                        if s.get("tags"):      self.results_text.insert("end", f"  Tags: {s['tags']}\n")
-                if o is not None:
+                    self.results_text.insert("end",
+                        f"  Org: {s['org']}  ·  Country: {s['country']}  ·  OS: {s['os']}\n"
+                        f"  Ports: {s['ports'] or 'n/a'}\n")
+                    if s.get("vulns") and s["vulns"] != "None": self.results_text.insert("end", f"  ⚠️  CVEs: {s['vulns']}\n")
+                    if s.get("hostnames"): self.results_text.insert("end", f"  Hostnames: {s['hostnames']}\n")
+                    if s.get("tags"):      self.results_text.insert("end", f"  Tags: {s['tags']}\n")
+                # ── CriminalIP — only show if real score returned ──
+                if it == "ip" and ci is not None and not ci.get("cip_error") and ci.get("cip_score") not in (None,"","0",0):
+                    self.results_text.insert("end", "\n▸ CriminalIP\n")
+                    self.results_text.insert("end",
+                        f"  {ci.get('cip_verdict','')}  ·  Score: {ci.get('cip_score','')}\n"
+                        f"  Type: {ci.get('cip_type','')}  ·  Country: {ci.get('cip_country','')}  "
+                        f"·  Org: {ci.get('cip_org','')}\n")
+                    if ci.get("cip_open_ports"): self.results_text.insert("end", f"  Ports: {ci['cip_open_ports']}\n")
+                    if ci.get("cip_cves") and ci["cip_cves"] != "None":
+                        self.results_text.insert("end", f"  ⚠️  CVEs: {ci['cip_cves']}\n")
+                    if ci.get("cip_tags"): self.results_text.insert("end", f"  Flags: {ci['cip_tags']}\n")
+                # ── IPQS — only show if fraud score > 0 ──
+                if it == "ip" and iq is not None and not iq.get("ipqs_error") and iq.get("ipqs_fraud_score") not in (None,"","0",0):
+                    self.results_text.insert("end", "\n▸ IPQualityScore\n")
+                    self.results_text.insert("end",
+                        f"  {iq.get('ipqs_verdict','')}  ·  Fraud Score: {iq.get('ipqs_fraud_score','')}\n"
+                        f"  VPN: {iq.get('ipqs_vpn','?')}  ·  Proxy: {iq.get('ipqs_proxy','?')}  "
+                        f"·  Tor: {iq.get('ipqs_tor','?')}  ·  Bot: {iq.get('ipqs_bot','?')}\n")
+                # ── OTX — only show if has pulses > 0 ──
+                if o is not None and not o.get("otx_error") and o.get("pulse_count",0) > 0:
                     self.results_text.insert("end", "\n▸ OTX AlienVault\n")
-                    if o.get("otx_error"): self.results_text.insert("end", f"  {o['otx_error']}\n")
-                    else:
-                        self.results_text.insert("end", f"  {o['otx_verdict']}  ·  Pulses: {o['pulse_count']}\n")
-                        if o.get("malware_families") and o["malware_families"] != "None":
-                            self.results_text.insert("end", f"  Malware: {o['malware_families']}\n")
-                        if o.get("tags") and o["tags"] != "None":
-                            self.results_text.insert("end", f"  Tags: {o['tags']}\n")
+                    self.results_text.insert("end", f"  {o['otx_verdict']}  ·  Pulses: {o['pulse_count']}\n")
+                    if o.get("malware_families") and o["malware_families"] != "None":
+                        self.results_text.insert("end", f"  Malware: {o['malware_families']}\n")
+                    if o.get("tags") and o["tags"] != "None":
+                        self.results_text.insert("end", f"  Tags: {o['tags']}\n")
+                # ── Pulsedive — only show if risk is not unknown/none/empty ──
+                if p is not None and not p.get("pd_error"):
+                    _pd_risk = str(p.get("pd_risk","")).lower().strip()
+                    if _pd_risk and _pd_risk not in ("unknown","none","low",""):
+                        self.results_text.insert("end", "\n▸ Pulsedive\n")
+                        self.results_text.insert("end",
+                            f"  {p.get('pd_verdict','')}  ·  Risk: {p.get('pd_risk','')}  "
+                            f"·  Type: {p.get('pd_type','')}\n")
+                        if p.get("pd_threats") and p["pd_threats"] != "None":
+                            self.results_text.insert("end", f"  Threats: {p['pd_threats']}\n")
+                        if p.get("pd_feeds") and p["pd_feeds"] != "None":
+                            self.results_text.insert("end", f"  Feeds: {p['pd_feeds']}\n")
+                        if p.get("pd_tags") and p["pd_tags"] != "None":
+                            self.results_text.insert("end", f"  Tags: {p['pd_tags']}\n")
             self.after(0, _ins_api)
 
             # ── Render free OSINT results ────────────────────────────
             def _ins_free(ic=cleaned, it=ioc_type,
-                          g=geo, d=dns_r, rv=rdns, whi=wh, u=uh, m=mb, t=tf):
-                W = "═"*62
+                          g=geo, d=dns_r, rv=rdns, whi=wh, u=uh, m=mb, t=tf,
+                          h_=hl, p_=pt, iq_=ipqs):
                 if it == "ip":
-                    self.results_text.insert("end", "\n▸ Geolocation  (ip-api.com)\n")
-                    if g.get("ipapi_error"): self.results_text.insert("end", f"  {g['ipapi_error']}\n")
-                    else:
+                    # Geolocation — always show for IPs (no error = useful context)
+                    if not g.get("ipapi_error") and g.get("country"):
+                        self.results_text.insert("end", "\n▸ Geolocation  (ip-api.com)\n")
                         self.results_text.insert("end",
                             f"  {g['city']}, {g['region']}, {g['country']}\n"
                             f"  ISP: {g['isp']}  ·  Org: {g['org']}\n"
@@ -1599,9 +2203,9 @@ class OSINTApp(ctk.CTk):
                             f"  Proxy: {g['proxy']}  ·  Hosting/DC: {g['hosting']}\n")
                     if rv: self.results_text.insert("end", f"\n▸ Reverse DNS\n  {rv}\n")
                 elif it == "domain":
-                    self.results_text.insert("end", "\n▸ DNS Records\n")
-                    if d.get("dns_error"): self.results_text.insert("end", f"  {d['dns_error']}\n")
-                    else:
+                    # DNS — always show for domains
+                    if not d.get("dns_error") and any(d.get(k) for k in ("a_records","mx","ns","aaaa_records","cname","txt")):
+                        self.results_text.insert("end", "\n▸ DNS Records\n")
                         if d.get("a_records"):    self.results_text.insert("end", f"  A:     {', '.join(d['a_records'])}\n")
                         if d.get("aaaa_records"): self.results_text.insert("end", f"  AAAA:  {', '.join(d['aaaa_records'][:3])}\n")
                         if d.get("mx"):           self.results_text.insert("end", f"  MX:    {', '.join(d['mx'][:3])}\n")
@@ -1609,63 +2213,85 @@ class OSINTApp(ctk.CTk):
                         if d.get("cname"):        self.results_text.insert("end", f"  CNAME: {', '.join(d['cname'][:2])}\n")
                         for txt in (d.get("txt") or [])[:3]:
                             self.results_text.insert("end", f"  TXT:   {txt[:100]}\n")
-                        if not any([d.get("a_records"), d.get("mx"), d.get("ns")]):
-                            self.results_text.insert("end", "  No DNS records found.\n")
-                    self.results_text.insert("end", "\n▸ WHOIS\n")
-                    if whi.get("whois_error"):  self.results_text.insert("end", f"  {whi['whois_error']}\n")
-                    elif whi.get("whois_data"): self.results_text.insert("end", whi["whois_data"]+"\n")
-                    else:                       self.results_text.insert("end", "  No WHOIS data.\n")
-                if u is not None:
+                    # WHOIS — always show for domains
+                    if not whi.get("whois_error") and whi.get("whois_data"):
+                        self.results_text.insert("end", "\n▸ WHOIS\n")
+                        self.results_text.insert("end", whi["whois_data"]+"\n")
+                    # PhishTank — only show if marked phishing
+                    if p_ is not None and not p_.get("pt_error") and p_.get("pt_verdict") and "not" not in str(p_.get("pt_verdict","")).lower():
+                        self.results_text.insert("end", "\n▸ PhishTank  (free)\n")
+                        self.results_text.insert("end", f"  {p_.get('pt_verdict','')}\n")
+                    # IPQS domain — only show if fraud score > 0
+                    if iq_ is not None and not iq_.get("ipqs_error") and iq_.get("ipqs_fraud_score") not in (None,"","0",0):
+                        self.results_text.insert("end", "\n▸ IPQualityScore  (Domain)\n")
+                        self.results_text.insert("end",
+                            f"  {iq_.get('ipqs_verdict','')}  ·  Fraud Score: {iq_.get('ipqs_fraud_score','')}\n")
+                # URLhaus — only show if there's an actual threat/match
+                if u is not None and not u.get("uh_error") and u.get("uh_threat"):
                     self.results_text.insert("end", "\n▸ URLhaus  (abuse.ch)\n")
-                    if u.get("uh_error"):   self.results_text.insert("end", f"  {u['uh_error']}\n")
-                    elif u.get("uh_threat"):
-                        line = f"  {u['uh_threat']}"
-                        if u.get("uh_urls"): line += f"  ({u['uh_urls']} entries)"
-                        self.results_text.insert("end", line+"\n")
-                        if u.get("uh_tags"): self.results_text.insert("end", f"  Tags: {u['uh_tags']}\n")
-                    else: self.results_text.insert("end", "  ⬜ No response.\n")
-                if it == "hash" and m is not None:
+                    line = f"  {u['uh_threat']}"
+                    if u.get("uh_urls"): line += f"  ({u['uh_urls']} entries)"
+                    self.results_text.insert("end", line+"\n")
+                    if u.get("uh_tags"): self.results_text.insert("end", f"  Tags: {u['uh_tags']}\n")
+                # MalwareBazaar — only show if verdict returned
+                if it == "hash" and m is not None and not m.get("mb_error") and m.get("mb_verdict"):
                     self.results_text.insert("end", "\n▸ MalwareBazaar  (abuse.ch)\n")
-                    if m.get("mb_error"):   self.results_text.insert("end", f"  {m['mb_error']}\n")
-                    elif m.get("mb_verdict"):
-                        self.results_text.insert("end", f"  {m['mb_verdict']}\n")
-                        if m.get("mb_file_name"):
-                            self.results_text.insert("end", f"  File: {m['mb_file_name']}  [{m['mb_file_type']}]\n")
-                        if m.get("mb_signature"):  self.results_text.insert("end", f"  Sig: {m['mb_signature']}\n")
-                        if m.get("mb_tags"):       self.results_text.insert("end", f"  Tags: {m['mb_tags']}\n")
-                        if m.get("mb_first_seen"): self.results_text.insert("end", f"  First seen: {m['mb_first_seen']}\n")
-                if t is not None:
+                    self.results_text.insert("end", f"  {m['mb_verdict']}\n")
+                    if m.get("mb_file_name"):
+                        self.results_text.insert("end", f"  File: {m['mb_file_name']}  [{m['mb_file_type']}]\n")
+                    if m.get("mb_signature"):  self.results_text.insert("end", f"  Sig: {m['mb_signature']}\n")
+                    if m.get("mb_tags"):       self.results_text.insert("end", f"  Tags: {m['mb_tags']}\n")
+                    if m.get("mb_first_seen"): self.results_text.insert("end", f"  First seen: {m['mb_first_seen']}\n")
+                # HashLookup — only show if verdict has content
+                if it == "hash" and h_ is not None and not h_.get("hl_error") and h_.get("hl_verdict"):
+                    self.results_text.insert("end", "\n▸ CIRCL HashLookup  (free)\n")
+                    self.results_text.insert("end", f"  {h_.get('hl_verdict','')}\n")
+                    if h_.get("hl_filename"):  self.results_text.insert("end", f"  File: {h_['hl_filename']}\n")
+                    if h_.get("hl_filetype"):  self.results_text.insert("end", f"  Type: {h_['hl_filetype']}\n")
+                    if h_.get("hl_parents"):   self.results_text.insert("end", f"  Parent packages: {h_['hl_parents']}\n")
+                # ThreatFox — only show if IOC actually found
+                if t is not None and not t.get("tf_error") and t.get("tf_verdict") and "not found" not in str(t.get("tf_verdict","")).lower():
                     self.results_text.insert("end", "\n▸ ThreatFox  (abuse.ch)\n")
-                    if t.get("tf_error"):   self.results_text.insert("end", f"  {t['tf_error']}\n")
-                    elif t.get("tf_verdict"):
-                        self.results_text.insert("end", f"  {t['tf_verdict']}\n")
-                        if t.get("tf_threat_type") and "Not found" not in t["tf_verdict"]:
-                            self.results_text.insert("end", f"  Threat: {t['tf_threat_type']}  ·  Malware: {t['tf_malware']}\n")
-                        if t.get("tf_tags") and "Not found" not in t["tf_verdict"]:
-                            self.results_text.insert("end", f"  Tags: {t['tf_tags']}\n")
-                    else: self.results_text.insert("end", "  ⬜ No response.\n")
+                    self.results_text.insert("end", f"  {t['tf_verdict']}\n")
+                    if t.get("tf_threat_type"):
+                        self.results_text.insert("end", f"  Threat: {t['tf_threat_type']}  ·  Malware: {t['tf_malware']}\n")
+                    if t.get("tf_tags"):
+                        self.results_text.insert("end", f"  Tags: {t['tf_tags']}\n")
             self.after(0, _ins_free)
             # ── OSINT URL list ───────────────────────────────────────
-            if ioc_type != "email":
-                src_list = self.osint.get_sources(ioc_type)
-                url_pairs = self.osint.build_url_pairs(cleaned, src_list)
-                def _ins_urls(ic=cleaned, pairs=url_pairs):
-                    self.urls_text.insert("end", f"\n{'═'*62}\n  {ic}\n{'═'*62}\n")
-                    for src, url in pairs:
-                        self.urls_text.insert("end", f"  {src:<20}  {url}\n")
-                self.after(0, _ins_urls)
-                if ioc_type == "domain": domain_iocs.append(cleaned)
+            src_list = self.osint.get_sources(ioc_type)
+            url_pairs = self.osint.build_url_pairs(cleaned, src_list)
+            def _ins_urls(ic=cleaned, pairs=url_pairs):
+                self.urls_text.insert("end", f"\n{'═'*62}\n  {ic}\n{'═'*62}\n")
+                for src, url in pairs:
+                    self.urls_text.insert("end", f"  {src:<20}  {url}\n")
+            self.after(0, _ins_urls)
+            if ioc_type == "domain": domain_iocs.append(cleaned)
 
-            # ── CSV row ──────────────────────────────────────────────
+            # ── CSV / HTML row ───────────────────────────────────────
             self.api_results.append({
                 "IOC": cleaned, "Type": ioc_type,
-                "VT_Verdict":(vt or {}).get("vt_verdict",""),"VT_Score":(vt or {}).get("vt_score",""),
-                "Abuse_Score":(abip or {}).get("abuse_score",""),
-                "GN_Verdict":(gn or {}).get("gn_verdict",""),"OTX_Verdict":(otx or {}).get("otx_verdict",""),
-                "Shodan_Ports":(shd or {}).get("ports",""),"Shodan_Vulns":(shd or {}).get("vulns",""),
-                "ThreatFox":(tf or {}).get("tf_verdict",""),"URLhaus":(uh or {}).get("uh_threat",""),
-                "MalwareBazaar":(mb or {}).get("mb_verdict",""),
-                "HIBP_Verdict":(hibp or {}).get("hibp_verdict",""),"HIBP_Breaches":(hibp or {}).get("breach_count",""),
+                "VT_Verdict":    (vt   or {}).get("vt_verdict",""),
+                "VT_Score":      (vt   or {}).get("vt_score",""),
+                "Abuse_Score":   (abip or {}).get("abuse_score",""),
+                "GN_Verdict":    (gn   or {}).get("gn_verdict",""),
+                "OTX_Verdict":   (otx  or {}).get("otx_verdict",""),
+                "Shodan_Ports":  (shd  or {}).get("ports",""),
+                "Shodan_Vulns":  (shd  or {}).get("vulns",""),
+                "CriminalIP":    (cip  or {}).get("cip_verdict",""),
+                "CriminalIP_Score": (cip or {}).get("cip_score",""),
+                "IPQS_Verdict":  (ipqs or {}).get("ipqs_verdict",""),
+                "IPQS_FraudScore": (ipqs or {}).get("ipqs_fraud_score",""),
+                "Pulsedive":     (pd   or {}).get("pd_verdict",""),
+                "ThreatFox":     (tf   or {}).get("tf_verdict",""),
+                "URLhaus":       (uh   or {}).get("uh_threat",""),
+                "MalwareBazaar": (mb   or {}).get("mb_verdict",""),
+                "HashLookup":    (hl   or {}).get("hl_verdict",""),
+                "PhishTank":     (pt   or {}).get("pt_verdict",""),
+                "HIBP_Verdict":  (hibp or {}).get("xon_verdict",""),
+                "HIBP_Breaches": (hibp or {}).get("breach_count",""),
+                "BreachVIP":     (bvip or {}).get("bvip_verdict",""),
+                "BreachVIP_Count": (bvip or {}).get("bvip_count",""),
             })
             pct = (idx+1)/total
             stat_txt = f"⏳  Processing {idx+1}/{total}:  {cleaned}"
@@ -1754,6 +2380,80 @@ class OSINTApp(ctk.CTk):
             for _, url in self.osint.build_url_pairs(cleaned, self.osint.get_sources(ioc_type)):
                 webbrowser.open_new_tab(url); count += 1
         if count: self.status_bar.configure(text=f"🌐  Opened {count} browser tab(s).")
+
+    def _export_html_report(self):
+        if not self.api_results:
+            messagebox.showinfo("Nothing to export","Run a lookup first."); return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".html", filetypes=[("HTML","*.html"),("All","*.*")],
+            initialfile="osint_report.html")
+        if not path: return
+        try:
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            rows_html = ""
+            verdict_colors = {"MALICIOUS": "#e06c75", "HIGH": "#e06c75", "CRITICAL": "#e06c75",
+                              "SUSPICIOUS": "#e5c07b", "MEDIUM": "#e5c07b",
+                              "Clean": "#98c379", "Low": "#98c379"}
+            def _vcolor(v):
+                v = str(v)
+                for k, c in verdict_colors.items():
+                    if k.upper() in v.upper(): return c
+                return "#abb2bf"
+            for row in self.api_results:
+                ioc = row.get("IOC",""); ioc_type = row.get("Type","")
+                vt_v = row.get("VT_Verdict",""); vt_s = row.get("VT_Score","")
+                rows_html += f"""
+  <tr>
+    <td><b style="color:#61afef">{ioc}</b></td>
+    <td><span style="background:#252535;padding:2px 6px;border-radius:4px">{ioc_type.upper()}</span></td>
+    <td style="color:{_vcolor(vt_v)}">{vt_v} {('('+str(vt_s)+')') if vt_s else ''}</td>
+    <td style="color:{_vcolor(row.get('Abuse_Score',''))}">Score: {row.get('Abuse_Score','')}</td>
+    <td style="color:{_vcolor(row.get('GN_Verdict',''))}">{row.get('GN_Verdict','')}</td>
+    <td style="color:{_vcolor(row.get('CriminalIP',''))}">{row.get('CriminalIP','')} {('('+str(row.get('CriminalIP_Score',''))) + ')' if row.get('CriminalIP_Score') else ''}</td>
+    <td style="color:{_vcolor(row.get('IPQS_Verdict',''))}">{row.get('IPQS_Verdict','')} {('('+str(row.get('IPQS_FraudScore',''))) + ')' if row.get('IPQS_FraudScore') else ''}</td>
+    <td style="color:{_vcolor(row.get('Pulsedive',''))}">{row.get('Pulsedive','')}</td>
+    <td style="color:{_vcolor(row.get('OTX_Verdict',''))}">{row.get('OTX_Verdict','')}</td>
+    <td style="color:{_vcolor(row.get('ThreatFox',''))}">{row.get('ThreatFox','')}</td>
+    <td style="color:{_vcolor(row.get('URLhaus',''))}">{row.get('URLhaus','')}</td>
+    <td style="color:{_vcolor(row.get('MalwareBazaar',''))}">{row.get('MalwareBazaar','')}</td>
+    <td style="color:{_vcolor(row.get('HashLookup',''))}">{row.get('HashLookup','')}</td>
+    <td style="color:{_vcolor(row.get('PhishTank',''))}">{row.get('PhishTank','')}</td>
+    <td style="color:{_vcolor(row.get('HIBP_Verdict',''))}">{row.get('HIBP_Verdict','')} {('('+str(row.get('HIBP_Breaches',''))) + ' breaches)' if row.get('HIBP_Breaches') else ''}</td>
+    <td style="color:{_vcolor(row.get('BreachVIP',''))}">{row.get('BreachVIP','')} {('('+str(row.get('BreachVIP_Count',''))) + ' sources)' if row.get('BreachVIP_Count') else ''}</td>
+  </tr>"""
+            html = f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<title>OSINT MultiSearch v10 Report</title>
+<style>
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{background:#1a1a2e;color:#abb2bf;font-family:'Segoe UI',Arial,sans-serif;padding:24px}}
+h1{{color:#61afef;font-size:1.8em;margin-bottom:4px}}
+.meta{{color:#5c6370;font-size:.9em;margin-bottom:20px}}
+table{{width:100%;border-collapse:collapse;font-size:13px;margin-top:12px}}
+th{{background:#252535;color:#61afef;padding:10px 12px;text-align:left;border-bottom:2px solid #3a3a6a;white-space:nowrap}}
+td{{padding:9px 12px;border-bottom:1px solid #252535;vertical-align:top}}
+tr:hover td{{background:#1f1f35}}
+.badge{{display:inline-block;padding:1px 8px;border-radius:4px;font-size:.8em;font-weight:bold}}
+</style></head>
+<body>
+<h1>⚡ OSINT MultiSearch v10 — Report</h1>
+<p class="meta">Generated: {ts} &nbsp;|&nbsp; {len(self.api_results)} IOC(s)</p>
+<table>
+<tr>
+  <th>IOC</th><th>Type</th><th>VirusTotal</th><th>AbuseIPDB</th>
+  <th>GreyNoise</th><th>CriminalIP</th><th>IPQS</th><th>Pulsedive</th>
+  <th>OTX</th><th>ThreatFox</th><th>URLhaus</th><th>MalwareBazaar</th>
+  <th>HashLookup</th><th>PhishTank</th><th>HIBP/XposedOrNot</th><th>Breach.VIP</th>
+</tr>
+{rows_html}
+</table>
+</body></html>"""
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(html)
+            self.status_bar.configure(text=f"✅  HTML report saved → {path}")
+            webbrowser.open_new_tab(f"file:///{path.replace(os.sep, '/')}")
+        except Exception as e:
+            messagebox.showerror("Export failed", str(e))
 
     def _export_csv(self):
         if not self.api_results:
