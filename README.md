@@ -45,7 +45,7 @@ cd MultiOSINT
 
 ### 2. Install dependencies
 ```bash
-pip install requests aiohttp
+pip install customtkinter pillow requests urllib3 python-whois dnspython xposedornot
 ```
 
 ### 3. Get your API keys (free tiers work fine)
@@ -55,7 +55,7 @@ pip install requests aiohttp
 
 ### 4. Run it
 ```bash
-python MultiOSINTv9.pyw
+python MultiOSINT.pyw
 ```
 
 On first run, you'll be prompted to enter your API keys. They're stored locally in `config.json`.
