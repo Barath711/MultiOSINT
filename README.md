@@ -1,9 +1,3 @@
-Updated todo list
-
-Here's the updated README for v11:
-
----
-
 # 🔎 MultiOSINT v11
 
 **A desktop threat intelligence platform for SOC analysts.**
