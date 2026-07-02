@@ -93,7 +93,7 @@ During incident response, analysts constantly copy-paste IOCs between browser ta
 
 ### 1. Install dependencies
 ```bash
-pip install PyQt6 pillow requests urllib3 python-whois dnspython extract-msg
+pip install PyQt6 pillow requests urllib3 python-whois dnspython extract-msg openpyxl
 ```
 
 ### 2. Run
