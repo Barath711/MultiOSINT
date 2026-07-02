@@ -1,22 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-OSINT MultiSearch v12
-======================
-Multi-mode security tool â€” iOS-style PyQt6 UI
-  â€¢ OSINT Lookup  â€” IPs, Domains, Hashes, Email addresses
-  â€¢ Phishing Analyzer â€” .eml / .msg triage with full enrichment
-  â€¢ OSINT Navigator â€” navigate IOCs with â†‘ â†“ arrows
-
-APIs: VirusTotal, AbuseIPDB, URLScan.io, GreyNoise, OTX AlienVault,
-      Shodan, abuse.ch, Joe Sandbox,
-      IPQualityScore, CriminalIP, Pulsedive, Google Gemini AI
-
-Free (no key): ip-api.com, DNS/rDNS, WHOIS, CIRCL.lu HashLookup, PhishTank,
-               XposedOrNot, Breach.VIP, EmailRep.io, LeakCheck.io
-"""
-
-# â”€â”€ Splash screen â€” shown immediately using stdlib tkinter only â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-# ── Circular animated splash screen (PyQt6) ─────────────────────────────────
 import sys as _sys, os as _os
 
 from PyQt6.QtWidgets import QApplication as _QApp, QWidget as _QW
