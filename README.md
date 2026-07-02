@@ -1,8 +1,8 @@
-# 🔎 MultiOSINT v11
+# 🔎 MultiOSINT v12
 
 **A desktop threat intelligence platform for SOC analysts.**
 
-Query **14+ OSINT sources** simultaneously — IPs, Domains, URLs, Hashes, and Emails — from a single interface. Triage phishing emails, analyze IOCs, and generate AI-powered summaries without switching tabs.
+Query **18+ OSINT sources** simultaneously — IPs, Domains, URLs, Hashes, and Emails — from a single interface. Triage phishing emails, analyze browser history, investigate IOCs, and generate AI-powered summaries without switching tabs.
 
 ![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=flat&logo=python&logoColor=white)
 ![PyQt6](https://img.shields.io/badge/UI-PyQt6-41CD52?style=flat&logo=qt&logoColor=white)
@@ -17,8 +17,9 @@ During incident response, analysts constantly copy-paste IOCs between browser ta
 
 **MultiOSINT** eliminates that friction:
 - Enter an IP, domain, URL, hash, or email **once**
-- Get results from **14+ sources** in parallel
+- Get results from **18+ sources** in parallel
 - Triage phishing `.eml`/`.msg` files with a single drag-and-drop
+- Parse Edge/Chrome **browser history & downloads** into a forensic timeline
 - Browse **160+ OSINT tools** from a built-in navigator
 - Generate a full analyst report with one Gemini AI click
 
@@ -27,23 +28,27 @@ During incident response, analysts constantly copy-paste IOCs between browser ta
 ## 🖥️ Feature Overview
 
 ### 🔍 OSINT Lookup
-| Source | IP | Domain | Hash | Email | Free |
-|--------|:--:|:------:|:----:|:-----:|:----:|
-| VirusTotal | ✅ | ✅ | ✅ | ✅ | Free tier |
-| AbuseIPDB | ✅ | — | — | — | Free tier |
-| GreyNoise | ✅ | — | — | — | Free tier |
-| Shodan | ✅ | — | — | — | API key |
-| CriminalIP | ✅ | — | — | — | API key |
-| IPQualityScore | ✅ | ✅ | — | ✅ | API key |
-| OTX AlienVault | ✅ | ✅ | ✅ | — | Free |
-| Pulsedive | ✅ | ✅ | — | — | API key |
-| URLhaus | ✅ | ✅ | — | — | Free |
-| ThreatFox | ✅ | ✅ | ✅ | — | Free |
-| MalwareBazaar | — | — | ✅ | — | Free |
-| CIRCL HashLookup | — | — | ✅ | — | Free |
-| XposedOrNot | — | — | — | ✅ | Free |
-| Breach.VIP | — | — | — | ✅ | Free |
-| Geolocation / rDNS / WHOIS / DNS | ✅ | ✅ | — | — | Free |
+| Source | IP | Domain | URL | Hash | Email | Free |
+|--------|:--:|:------:|:---:|:----:|:-----:|:----:|
+| VirusTotal | ✅ | ✅ | ✅ | ✅ | ✅ | Free tier |
+| AbuseIPDB | ✅ | — | — | — | — | Free tier |
+| GreyNoise | ✅ | — | — | — | — | Free tier |
+| Shodan | ✅ | — | — | — | — | API key |
+| CriminalIP | ✅ | — | — | — | — | API key |
+| IPQualityScore | ✅ | ✅ | ✅ | — | ✅ | API key |
+| OTX AlienVault | ✅ | ✅ | — | ✅ | — | Free |
+| Pulsedive | ✅ | ✅ | — | — | — | API key |
+| URLScan.io | ✅ | ✅ | ✅ | — | — | Free (key optional) |
+| PhishTank | — | ✅ | ✅ | — | — | Free |
+| URLhaus | ✅ | ✅ | — | — | — | Free |
+| ThreatFox | ✅ | ✅ | ✅ | ✅ | — | Free |
+| MalwareBazaar | — | — | — | ✅ | — | Free |
+| CIRCL HashLookup | — | — | — | ✅ | — | Free |
+| XposedOrNot | — | — | — | — | ✅ | Free |
+| Breach.VIP | — | — | — | — | ✅ | Free |
+| EmailRep.io | — | — | — | — | ✅ | Free |
+| LeakCheck.io | — | — | — | — | ✅ | Free |
+| Geolocation / rDNS / WHOIS / DNS | ✅ | ✅ | — | — | — | Free |
 
 ### 📧 Phishing Analyzer
 - Drag-and-drop `.eml` / `.msg` file triage
@@ -51,9 +56,21 @@ During incident response, analysts constantly copy-paste IOCs between browser ta
 - Enriches all extracted IOCs automatically via the same API stack
 - Header analysis with hop-by-hop SPF/DKIM/DMARC visualization
 - Joe Sandbox detonation for attachments with screenshot preview
+- URLScan.io screenshot capture for suspicious links
 - Export full report to HTML
 
-### 🌐 OSINT Navigator
+### 🌐 Browser History Analyzer *(new in v12)*
+- Load one or more **Edge / Chrome `History`** SQLite databases
+- **Preview browsing history** — URL, title, visit time (UTC), and correlated downloads
+- **Downloads tab** — file name, start/end time, state, size, source & final URL
+- **Downloads-only filter** — surface just the history rows that produced a download
+- Correlates downloads to history entries by exact URL **and by hostname**
+- Live search filter across URLs, titles, and file names
+- **Export to XLSX** — separate History and Downloads sheets, with optional case/subject label prefix
+- Batch export across multiple History files in one run
+- All timestamps normalized to **UTC** (WebKit epoch conversion)
+
+### 🧭 OSINT Navigator
 - 160+ curated OSINT tools across 14 categories:
   Search, IP Info, Threat Intel, Hash Lookup, Email & Breach, Email Headers, Attack Surface, Vulnerabilities, Malware Analysis, Malware Feeds, Phishing, Social Media & People, Utilities, AI Tools
 - Live search filter across all tools
@@ -73,16 +90,18 @@ During incident response, analysts constantly copy-paste IOCs between browser ta
 - Keys saved locally to `config.json` — never sent anywhere except the respective APIs
 
 ### 📊 Reporting
-- Export results to **TXT** or **CSV**
+- Export OSINT results to **TXT** or **CSV**
+- Export browser history & downloads to **XLSX**
+- Export phishing report to **HTML**
 - Clean results view — errors and "not found" responses suppressed automatically
 
 ---
 
-## 🎨 UI Highlights (v11)
+## 🎨 UI Highlights
 
-- **PyQt6** — replaced CustomTkinter entirely
-- **iOS-style design** — smooth animated tab transitions, pill buttons, frosted cards
-- **Light / Dark mode toggle** — bottom-right corner, seamless color transitions, light is default
+- **Three top-level modes** — 🔍 OSINT Lookup · 🎣 Phishing Analyzer · 🌐 Browser History — switch via header pills
+- **PyQt6** — iOS-style design with smooth animated tab transitions, pill buttons, and frosted cards
+- **Light / Dark mode toggle** — seamless color transitions, light is default; theme propagates to the Browser History panel
 - **Animated circular splash screen** on startup — spinning arc progress indicator
 - **Fullscreen by default** — maximized on launch
 - Custom `.ico` icon support — just drop `myicon.ico` next to the `.pyw`
@@ -98,7 +117,7 @@ pip install PyQt6 pillow requests urllib3 python-whois dnspython extract-msg ope
 
 ### 2. Run
 ```bash
-pythonw MultiOSINTv11.pyw
+pythonw MultiOSINT.pyw
 ```
 > On Windows, use `pythonw` (not `python`) to suppress the console window.  
 > Or: right-click → Open with → `pythonw.exe` → tick *Always use this app*
@@ -114,34 +133,39 @@ Open the **⚙️ Settings** tab inside the app. Keys are saved to `config.json`
 | OTX AlienVault | https://otx.alienvault.com/api |
 | IPQualityScore | https://www.ipqualityscore.com/user/api-keys |
 | Pulsedive | https://pulsedive.com/account/ |
+| URLScan.io | https://urlscan.io/user/profile/ |
 | Google Gemini | https://aistudio.google.com/app/apikey |
 
----
+> URLScan.io, PhishTank, EmailRep.io, and LeakCheck.io work with no key (rate-limited). Adding a URLScan key enables live screenshot scans.
 
+---
 
 ## 🗂️ File Structure
 
 ```
 MultiOSINT/
-├── MultiOSINTv11.pyw   # Main application (single file)
+├── MultiOSINT.pyw      # Main application (single file)
 ├── config.json         # API keys (edit per user, never commit)
 └── myicon.ico          # App icon (optional, external)
 ```
 
 ---
 
-## ✅ What's New in v11
+## ✅ What's New in v12
 
-- **PyQt6 rewrite** — full iOS-style UI, replaces CustomTkinter
-- **Light / Dark mode** with seamless toggle (light default)
-- **Animated splash screen** — circular spinning arc on startup
-- **IOC navigation (▲ ▼)** in the Navigator tab — step through multiple IOCs without copy-paste
-- **API key masking** — all keys hidden by default; Show/Hide toggle
-- **Gemini threading** — AI summary runs non-blocking; button locks during generation
-- **Animated tab transitions** across all panels
-- **Fullscreen default** — maximized on launch
-- **Color-coded Navigator headers** — section headings visually distinct from tool buttons
-- **Custom icon support** — external `myicon.ico` loaded at runtime
+- **🌐 Browser History Analyzer** — brand-new mode: parse Edge/Chrome History DBs into browsing + download timelines, correlate downloads by URL and hostname, filter, and export to XLSX (UTC timestamps)
+- **4 new OSINT sources** — URLScan.io, PhishTank, EmailRep.io, and LeakCheck.io added to the lookup engine
+- **Expanded email enrichment** — EmailRep.io reputation + LeakCheck.io breach lookups alongside XposedOrNot and Breach.VIP
+- **URL coverage** — URLScan.io and PhishTank verdicts for URL/domain IOCs
+- **URLScan screenshots** — live scan + screenshot preview in the Sandbox/Phishing flow
+- **Restructured header** — three top-level mode pills (OSINT Lookup · Phishing Analyzer · Browser History)
+- **Batch XLSX export** — process multiple History files in a single run with case/subject labels
+
+---
+
+## 📦 From v11
+
+Everything from the v11 PyQt6 rewrite carries forward: iOS-style UI, light/dark toggle, animated splash screen, IOC navigation (▲ ▼), API key masking, non-blocking Gemini threading, animated tab transitions, fullscreen default, and custom icon support.
 
 ---
 
@@ -160,5 +184,5 @@ MIT — use it, modify it, make your SOC faster.
 ## 👤 Author
 
 **Barath A C**  
-SOC Analyst II @ Deloitte USI  
+SOC Analyst II
 [LinkedIn](https://linkedin.com/in/barath07) · [GitHub](https://github.com/Barath711)
